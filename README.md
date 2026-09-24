@@ -282,8 +282,39 @@ Reporting both numbers rather than only the flattering one: the
 optimization is real, it's just not the bottleneck at this pipeline's
 current profile.
 
-Next: phase C (the remaining buffer-growth cleanup in
-`build_float64_column`/`build_bool_column`).
+### Phase C: finish the buffer-growth cleanup
+
+The v1 fix only pre-sized `build_string_column`'s *value* bytes — its own
+`null_bits` list, plus `build_float64_column`'s and `build_bool_column`'s
+`null_bits`/`value_bits`, and the per-field intermediate lists in the
+three `*_to_record_batch` functions (`ids`, `genders`, `codes`, ...), were
+all still growing via `.append()` with no capacity reserved even though
+the final length is known before the loop starts. Capacity-reserved all
+of them (`List[T](capacity=N)`, the same technique already used
+elsewhere in this codebase) — performance-only, no behavior change (all 5
+`test_fhir_arrow.mojo` cases pass unchanged).
+
+### Checkpoint: A + B + C combined
+
+Same dataset, same machine, re-run back to back:
+
+| Resource | Mojo (A+B+C) | Python | vs v2 | vs Python |
+|---|---|---|---|---|
+| Patient (577 rows) | 5.5 ms, 105,119 rows/sec | 24.6 ms, 23,437 rows/sec | 1.07x faster | **Mojo 4.48x faster** |
+| Observation (266,750 rows) | 2,131.9 ms, 125,125 rows/sec | 2,621.3 ms, 101,762 rows/sec | 1.05x faster | **Mojo 1.23x faster** |
+| Condition (19,025 rows) | 140.8 ms, 135,118 rows/sec | 154.2 ms, 123,386 rows/sec | 1.04x faster | **Mojo 1.10x faster** |
+
+Modest, real, across-the-board gains over v2 (roughly 4-7%) rather than a
+dramatic jump — most of the individual phase A/B/C changes were each
+small or fully swamped by other costs in isolation (see phase B above),
+but they compound. The margins on Observation (+23%) and Condition (+10%)
+are meaningfully more comfortable than v2's thin +11%/+5%, though still
+not as decisive as Patient's.
+
+Per the project plan, this is a deliberate checkpoint: phases D
+(parallelism) and E (SIMD scanning) are bigger, riskier changes, and
+phase E in particular is only worth attempting if a real gap remains
+after D.
 
 ## Known limitations
 
