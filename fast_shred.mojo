@@ -174,6 +174,74 @@ def _find_key(b: Span[UInt8, _], obj_start: Int, key: String) raises -> Optional
         i = _skip_value(b, value_start)
 
 
+# ── _find_keys: single-pass multi-key lookup ─────────────────────────────────
+#
+# _find_key re-scans an object from the start on every call. Every shredder
+# below used to call it repeatedly against the *same* object (e.g. 6 times
+# for Observation's top level), re-walking and re-skipping every earlier
+# key's value from scratch each time. _find_keys walks an object's direct
+# keys exactly once and resolves an arbitrary set of wanted keys in that
+# single pass, early-exiting once every slot has been filled.
+
+
+def _find_keys(
+    b: Span[UInt8, _], obj_start: Int, keys: List[String]
+) raises -> List[Optional[Int]]:
+    """Scan the direct keys of the object starting at obj_start (index of
+    '{') once, resolving the value_start index for every name in `keys` in
+    a single pass. Returns a list the same length/order as `keys`; a slot
+    is None if that key never appears. Order-independent (scans whatever
+    key order the object actually has); skips non-matching values via
+    _skip_value without allocating anything for them; stops scanning as
+    soon as every requested key has been found."""
+    var n_keys = len(keys)
+    var results = List[Optional[Int]](capacity=n_keys)
+    for _ in range(n_keys):
+        results.append(Optional[Int](None))
+    var remaining = n_keys
+
+    var n = len(b)
+    var i = obj_start
+    while i < n and _is_ws(b[i]):
+        i += 1
+    if i >= n or b[i] != _LBRACE:
+        raise Error("fast_shred: _find_keys: expected '{' at position " + String(obj_start))
+    i += 1  # skip '{'
+
+    while remaining > 0:
+        while i < n and (_is_ws(b[i]) or b[i] == _COMMA):
+            i += 1
+        if i >= n:
+            raise Error("fast_shred: _find_keys: unterminated object")
+        if b[i] == _RBRACE:
+            break
+        if b[i] != _QUOTE:
+            raise Error("fast_shred: _find_keys: expected '\"' at key position " + String(i))
+
+        var key_start = i
+        var key_end = _skip_string(b, i)  # index just past closing quote
+
+        var j = key_end
+        while j < n and _is_ws(b[j]):
+            j += 1
+        if j >= n or b[j] != _COLON:
+            raise Error("fast_shred: _find_keys: expected ':' after key at " + String(key_end))
+        j += 1
+        while j < n and _is_ws(b[j]):
+            j += 1
+        var value_start = j
+
+        for k in range(n_keys):
+            if not results[k] and _bytes_eq_str(b, key_start + 1, key_end - 1, keys[k]):
+                results[k] = Optional[Int](value_start)
+                remaining -= 1
+                break
+
+        i = _skip_value(b, value_start)
+
+    return results^
+
+
 # ── _first_array_element ──────────────────────────────────────────────────────
 
 

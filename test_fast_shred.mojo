@@ -6,7 +6,7 @@
 # Section 3: adversarial cases the tree parser never had to worry about.
 
 from fast_shred import (
-    _skip_value, _find_key, _first_array_element,
+    _skip_value, _find_key, _find_keys, _first_array_element,
     shred_patient_fast, shred_observation_fast, shred_condition_fast,
 )
 
@@ -176,6 +176,74 @@ def test_find_key_out_of_order_with_unknown_fields() raises:
     assert_true(Bool(id_start), "id should be found despite appearing late and out of order")
     var gender_start = _find_key(b, 0, "gender")
     assert_true(Bool(gender_start), "gender should be found despite unrelated nested objects around it")
+
+
+# ── _find_keys ───────────────────────────────────────────────────────────────
+
+
+def test_find_keys_all_present_same_order() raises:
+    var s = String('{"id": "p1", "gender": "female", "birthDate": "1990-01-01"}')
+    var b = s.as_bytes()
+    var keys: List[String] = ["id", "gender", "birthDate"]
+    var starts = _find_keys(b, 0, keys)
+    assert_eq_int(len(starts), 3, "should return one slot per requested key")
+    assert_true(Bool(starts[0]), "id should be found")
+    assert_true(Bool(starts[1]), "gender should be found")
+    assert_true(Bool(starts[2]), "birthDate should be found")
+    # Cross-check against single-key _find_key for the exact same indices.
+    assert_eq_int(starts[0].value(), _find_key(b, 0, "id").value(), "id index should match _find_key")
+    assert_eq_int(starts[1].value(), _find_key(b, 0, "gender").value(), "gender index should match _find_key")
+    assert_eq_int(starts[2].value(), _find_key(b, 0, "birthDate").value(), "birthDate index should match _find_key")
+
+
+def test_find_keys_all_present_different_order() raises:
+    # Object key order does not match the requested key order.
+    var s = String('{"birthDate": "1990-01-01", "id": "p1", "gender": "female"}')
+    var b = s.as_bytes()
+    var keys: List[String] = ["id", "gender", "birthDate"]
+    var starts = _find_keys(b, 0, keys)
+    assert_eq_int(starts[0].value(), _find_key(b, 0, "id").value(), "id index should match _find_key regardless of scan order")
+    assert_eq_int(starts[1].value(), _find_key(b, 0, "gender").value(), "gender index should match _find_key regardless of scan order")
+    assert_eq_int(starts[2].value(), _find_key(b, 0, "birthDate").value(), "birthDate index should match _find_key regardless of scan order")
+
+
+def test_find_keys_some_absent() raises:
+    var s = String('{"id": "p1", "gender": "female"}')
+    var b = s.as_bytes()
+    var keys: List[String] = ["id", "gender", "birthDate", "deceasedBoolean"]
+    var starts = _find_keys(b, 0, keys)
+    assert_true(Bool(starts[0]), "id should be found")
+    assert_true(Bool(starts[1]), "gender should be found")
+    assert_true(not Bool(starts[2]), "birthDate should be absent")
+    assert_true(not Bool(starts[3]), "deceasedBoolean should be absent")
+
+
+def test_find_keys_no_false_positive_on_prefix() raises:
+    # Wanting "code" must not match "codePrefix" (or "coding").
+    var s = String('{"codePrefix": "x", "coding": "y", "code": "z"}')
+    var b = s.as_bytes()
+    var keys: List[String] = ["code"]
+    var starts = _find_keys(b, 0, keys)
+    assert_true(Bool(starts[0]), "code should be found")
+    assert_eq_int(starts[0].value(), _find_key(b, 0, "code").value(), "should match the real \"code\" key only")
+
+
+def test_find_keys_all_found_early_does_not_overread() raises:
+    # All wanted keys appear as the first two entries; a large unrelated
+    # trailing object (including one that looks like it could desync
+    # scanning, e.g. contains braces/brackets in a string) must not be
+    # touched incorrectly and must not cause an out-of-bounds/parse error.
+    var s = String(
+        '{"id": "p1", "gender": "female", "note": "trailing {weird} [stuff]",'
+        ' "extension": [{"url": "x", "valueString": "y"}], "meta": {"a": 1}}'
+    )
+    var b = s.as_bytes()
+    var keys: List[String] = ["id", "gender"]
+    var starts = _find_keys(b, 0, keys)
+    assert_true(Bool(starts[0]), "id should be found")
+    assert_true(Bool(starts[1]), "gender should be found")
+    assert_eq_int(starts[0].value(), _find_key(b, 0, "id").value(), "id index should match _find_key")
+    assert_eq_int(starts[1].value(), _find_key(b, 0, "gender").value(), "gender index should match _find_key")
 
 
 # ── _first_array_element ──────────────────────────────────────────────────────
@@ -458,6 +526,17 @@ def main() raises:
     print("PASS test_find_key_only_direct_keys_not_nested")
     test_find_key_out_of_order_with_unknown_fields()
     print("PASS test_find_key_out_of_order_with_unknown_fields")
+
+    test_find_keys_all_present_same_order()
+    print("PASS test_find_keys_all_present_same_order")
+    test_find_keys_all_present_different_order()
+    print("PASS test_find_keys_all_present_different_order")
+    test_find_keys_some_absent()
+    print("PASS test_find_keys_some_absent")
+    test_find_keys_no_false_positive_on_prefix()
+    print("PASS test_find_keys_no_false_positive_on_prefix")
+    test_find_keys_all_found_early_does_not_overread()
+    print("PASS test_find_keys_all_found_early_does_not_overread")
 
     test_first_array_element_present()
     print("PASS test_first_array_element_present")
