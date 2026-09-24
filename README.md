@@ -8,11 +8,24 @@ no C dependencies.
 ## Quick start
 
 ```bash
-pixi install                        # resolves arrow (git dep)
-pixi run test-ndjson                # 4 tests
-pixi run test-fast-shred            # 35 tests
-pixi run test-fhir-arrow            # 5 tests
+pixi install                        # resolves arrow (git dep) + max
+pixi run test-ndjson                # 13 tests
+pixi run test-fast-shred            # 45 tests
+pixi run test-fhir-arrow            # 8 tests
 ```
+
+For the large-file (multi-core) path:
+
+```bash
+pixi run build-parallel-worker      # compiles parallel_worker
+pixi run build-merge-worker         # compiles merge_worker
+pixi run build-chunk-planner        # compiles chunk_planner
+bench/run_parallel_mojo.sh <ndjson_path> <out_path> <Patient|Observation|Condition> [num_workers]
+```
+
+See **Benchmark → Phase D** below for when this is actually worth reaching
+for (large files only — the fixed per-process cost doesn't pay for itself
+on small ones, in either Mojo or Python).
 
 End-to-end example:
 
@@ -316,6 +329,87 @@ Per the project plan, this is a deliberate checkpoint: phases D
 phase E in particular is only worth attempting if a real gap remains
 after D.
 
+### Phase D: parallelism (process-level, not in-process threads)
+
+The plan called for reusing `1brc_arrow`'s in-process worker pattern
+(`max.algorithm.parallelize` with a capturing `@parameter def` closure per
+worker). That pattern does not work on this repo's toolchain: **confirmed
+empirically** that Mojo 1.1.0/max 26.6.0 removed `fn` entirely (only `def`
+exists now), every nested `def` closure is unconditionally tagged
+`capturing` regardless of what it actually captures, and `parallelize`'s
+`FuncType` bound only accepts genuinely non-capturing (module-level)
+functions — which in turn can't receive runtime shared state via closures,
+mutable module-level globals (unsupported: "global variables are not
+supported"), or dynamic values bound as compile-time parameters ("cannot
+use a dynamic value in a parameter list"). `1brc_arrow` itself is pinned to
+the older Mojo 1.0.0/max 26.5.0 toolchain, where the capturing-closure
+pattern still worked. The full trail of minimal reproductions is in
+`tasks/lessons.md`.
+
+So this phase uses OS-process parallelism instead, and went through two
+slower designs before landing on the one that actually helps (all measured,
+not guessed — see `parallel_worker.mojo`'s header for the same writeup in
+code):
+
+1. **Row-index range into the whole file.** Each worker called
+   `read_ndjson_lines` on the *entire* file to compute the span list it
+   would then slice a subset of — so 8 workers redundantly paid the
+   full-file read+scan cost. 8-worker Observation: **4,748 ms**, slower
+   than the 2,131.9 ms sequential baseline.
+2. **Physically splitting the file with `split` first.** Correct, but
+   `Observation.ndjson` is 262 MB, and `split` has to copy every byte of
+   it to disk before any shredding starts, then `merge_worker` re-reads
+   all the chunk outputs afterward. That I/O alone (~1s to split) was
+   comparable to the entire sequential baseline. 8-worker Observation:
+   **2,819 ms** — still slower, though much closer.
+3. **Byte-range reads via seek, computed once (current).** A new
+   `chunk_planner` binary reads the file exactly once to find
+   newline-aligned byte boundaries for N chunks. Each `parallel_worker`
+   then opens the *original* file directly and reads only its own
+   `[start_byte, end_byte)` range via `open(path).seek(...).read(...)` — no
+   whole-file re-read, no physical copy. `merge_feathers` combines the N
+   chunk Feather files into one by concatenating their RecordBatches
+   (Arrow's IPC file format natively supports multiple batches per file,
+   so this is a batch concat, not a byte-level merge or a re-shred).
+
+Per the user's explicit fairness decision: since Mojo got multi-core
+shredding, the Python baseline got multiprocessing too
+(`bench_python_parallel.py`, a `ProcessPoolExecutor` splitting the same
+file the same way), so this stays a parallel-vs-parallel comparison, not
+parallel-Mojo-vs-single-threaded-Python. 8 workers both sides (physical
+core count on the benchmark machine), same Synthea data:
+
+| Resource | Sequential Mojo (A+B+C) | Parallel Mojo | Parallel Python | Parallel Mojo vs Parallel Python |
+|---|---|---|---|---|
+| Patient (577 rows) | 5.5 ms | 99.4 ms | 654.0 ms | **Mojo 6.58x faster** |
+| Observation (266,750 rows) | 2,131.9 ms | 1,685.0 ms | 1,720.2 ms | **Mojo 1.02x faster** |
+| Condition (19,025 rows) | 140.8 ms | 202.3 ms | 723.3 ms | **Mojo 3.58x faster** |
+
+**Honest reading, not a clean "multi-core wins" headline**: Mojo's
+parallel path beats Python's parallel path on all three resource types,
+but going parallel only beat *sequential Mojo* for Observation (1,685.0 ms
+vs. 2,131.9 ms) — for Patient and Condition, both languages' parallel runs
+are slower than their own sequential runs (Patient: 99.4 ms parallel vs.
+5.5 ms sequential; Condition: 202.3 ms parallel vs. 140.8 ms sequential).
+Process-spawn overhead (8 process launches, each with real fixed cost) is
+large enough that it only pays for itself once a chunk's actual shredding
+work is big enough to amortize it — true here only for the 266,750-row
+file. The reason Mojo still wins the parallel-vs-parallel comparison even
+where parallelism doesn't pay off over sequential is that Mojo's fixed
+cost per process is much lower than Python's: no interpreter startup, no
+`pandas`/`pyarrow` import per worker, no pickling results back across the
+process boundary. Practical takeaway: process-level parallelism is worth
+reaching for here only above some file-size threshold, in either language
+— for smaller files, plain sequential is simply better, and this repo's
+`ndjson_to_feather` (sequential) remains the right default; `parallel_worker`
++ `chunk_planner` + `merge_worker` (via `bench/run_parallel_mojo.sh`) is
+there for large files specifically.
+
+An explicit equivalence test (`test_parallel_chunked_equivalent_to_sequential`
+in `test_fhir_arrow.mojo`) proves chunk+merge produces identical row
+values, in identical order, to the plain sequential path on the same
+input, before any of these numbers were trusted.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars cannot currently open the `.feather` files
@@ -337,10 +431,13 @@ after D.
   is dropped, not preserved in an "extra fields" column.
 - `id` is the only field treated as required; every other field's absence
   is a null in that row, not an error.
-- No streaming: `read_ndjson_lines` loads the whole file into memory as
-  `List[String]` before shredding. Lighter than v0's `List[JsonValue]` (no
-  tree per line), but still not streaming; would need reworking for exports
-  too large to fit in memory.
+- No streaming on the sequential path: `read_ndjson_lines` loads the whole
+  file into memory as one `String` before shredding (lines are then
+  zero-copy byte spans into it, not separate allocations, but the whole
+  file is still resident at once). The parallel path (`chunk_planner` +
+  `parallel_worker`, see Benchmark → Phase D) reads bounded byte ranges via
+  seek instead, and is the better fit for exports too large to hold in
+  memory in one piece, though it isn't a true streaming reader either.
 - `fast_shred.mojo`'s byte scanner is intentionally narrow, not a general
   JSON parser: it's built to shred exactly the field paths listed above
   correctly (including realistic adversarial cases like escaped characters
@@ -353,6 +450,12 @@ after D.
 
 - [arrow](https://github.com/Mosaad-M/arrow) `>=1.1.0`: pure-Mojo Arrow IPC
   encoder/decoder (pulls in `flatbuffers` transitively)
+
+No `max` dependency: Phase D's parallel path investigated
+`max.algorithm.parallelize` (see Benchmark → Phase D) but ended up not
+using it — the shipped parallel path is process-level, driven entirely by
+the shell (`bench/run_parallel_mojo.sh`) and this repo's own compiled
+binaries, so `max` was removed from `pixi.toml` again once that was clear.
 
 ## License
 

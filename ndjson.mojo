@@ -53,3 +53,34 @@ def read_ndjson_lines(path: String) raises -> Tuple[String, List[Tuple[Int, Int]
         raise Error("ndjson: read_ndjson_lines: no records found in " + path)
 
     return Tuple[String, List[Tuple[Int, Int]]](content^, spans^)
+
+
+def read_ndjson_range(
+    path: String, start_byte: Int, end_byte: Int
+) raises -> Tuple[String, List[Tuple[Int, Int]]]:
+    """Like read_ndjson_lines, but reads only [start_byte, end_byte) of the
+    file via seek+read instead of the whole file. Used by the parallel
+    shredding path (parallel_worker.mojo): each worker process reads only
+    its own chunk's bytes directly from the ORIGINAL file, no whole-file
+    read and no physical file copy. Caller (chunk_planner.mojo) is
+    responsible for aligning start_byte/end_byte to line boundaries -- this
+    function doesn't adjust for misaligned input, it just reads exactly the
+    given byte range and finds line spans within it."""
+    var f = open(path, "r")
+    _ = f.seek(start_byte)
+    var content = f.read(end_byte - start_byte)
+    f.close()
+
+    var spans = find_line_spans(content)
+    if len(spans) == 0:
+        raise Error(
+            "ndjson: read_ndjson_range: no records found in "
+            + path
+            + " ["
+            + String(start_byte)
+            + ", "
+            + String(end_byte)
+            + ")"
+        )
+
+    return Tuple[String, List[Tuple[Int, Int]]](content^, spans^)

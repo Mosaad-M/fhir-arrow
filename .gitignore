@@ -1,3 +1,7 @@
 .pixi/
 .mojo_flags
 *.feather
+__pycache__/
+/chunk_planner
+/merge_worker
+/parallel_worker

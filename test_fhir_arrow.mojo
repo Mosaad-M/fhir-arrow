@@ -208,38 +208,41 @@ def test_ndjson_to_feather_condition_end_to_end() raises:
 
 
 def test_ndjson_range_to_feather_produces_subset() raises:
-    """Ndjson_range_to_feather([0, 2)) on a 3-row fixture writes only rows 0-1."""
+    """Ndjson_range_to_feather on the byte range covering only rows 0-1 of a
+    3-row fixture ([0, 253): row 0 is bytes [0,167), row 1 is [168,252))."""
     ndjson_range_to_feather(
         "fixtures/patients_small.ndjson",
         "/tmp/fhir_arrow_patients_range01.feather",
         "Patient",
         0,
-        2,
+        253,
     )
     var file_bytes = Path("/tmp/fhir_arrow_patients_range01.feather").read_bytes()
     var result = decode_arrow_file(file_bytes)
     var batches = result[1].copy()
-    assert_eq_int(Int(batches[0].length), 2, "range [0,2) row count")
+    assert_eq_int(Int(batches[0].length), 2, "range row count")
     var id_col = batches[0].columns[0].copy()
     assert_eq_str(_get_utf8(id_col, 0), "p1", "range row 0 id")
     assert_eq_str(_get_utf8(id_col, 1), "p2", "range row 1 id")
 
 
 def test_merge_feathers_combines_in_order() raises:
-    """Two range-chunk Feather files merge into one file with all rows, chunk order preserved."""
+    """Two byte-range chunks merge into one file with all rows, chunk order
+    preserved (chunk 0: bytes [0,253) = rows p1,p2; chunk 1: bytes [253,
+    999999) = row p3, using a past-EOF end since read() short-reads at EOF)."""
     ndjson_range_to_feather(
         "fixtures/patients_small.ndjson",
         "/tmp/fhir_arrow_patients_chunk0.feather",
         "Patient",
         0,
-        2,
+        253,
     )
     ndjson_range_to_feather(
         "fixtures/patients_small.ndjson",
         "/tmp/fhir_arrow_patients_chunk1.feather",
         "Patient",
-        2,
-        3,
+        253,
+        999999,
     )
     var paths = List[String]()
     paths.append("/tmp/fhir_arrow_patients_chunk0.feather")
@@ -275,14 +278,14 @@ def test_parallel_chunked_equivalent_to_sequential() raises:
         "/tmp/fhir_arrow_patients_eqchunk0.feather",
         "Patient",
         0,
-        2,
+        253,
     )
     ndjson_range_to_feather(
         "fixtures/patients_small.ndjson",
         "/tmp/fhir_arrow_patients_eqchunk1.feather",
         "Patient",
-        2,
-        3,
+        253,
+        999999,
     )
     var paths = List[String]()
     paths.append("/tmp/fhir_arrow_patients_eqchunk0.feather")

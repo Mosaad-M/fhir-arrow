@@ -1,4 +1,4 @@
-from ndjson import find_line_spans, read_ndjson_lines
+from ndjson import find_line_spans, read_ndjson_lines, read_ndjson_range
 from std.pathlib import Path
 
 
@@ -132,6 +132,70 @@ def test_read_ndjson_lines_does_not_reject_invalid_json() raises:
     )
 
 
+# ── read_ndjson_range: seek+read byte-range reader for the parallel path ────
+
+
+def test_read_ndjson_range_reads_only_the_given_bytes() raises:
+    """A byte range covering only the first line yields exactly that line,
+    even though the file has more content after end_byte."""
+    _write(
+        "/tmp/fhir_arrow_test_range_n.ndjson",
+        '{"a": 1}\n{"a": 2}\n{"a": 3}\n',
+    )
+    # bytes [0, 9) is exactly '{"a": 1}\n'
+    var result = read_ndjson_range("/tmp/fhir_arrow_test_range_n.ndjson", 0, 9)
+    var content = result[0]
+    var spans = result[1].copy()
+    assert_eq_int(len(spans), 1, "range should yield exactly 1 line")
+    assert_eq_str(_slice(content, spans[0]), '{"a": 1}', "range line 0")
+
+
+def test_read_ndjson_range_middle_chunk() raises:
+    """A byte range covering the middle line only (not the first or last)."""
+    _write(
+        "/tmp/fhir_arrow_test_range_mid.ndjson",
+        '{"a": 1}\n{"a": 2}\n{"a": 3}\n',
+    )
+    # bytes [9, 18) is exactly '{"a": 2}\n'
+    var result = read_ndjson_range("/tmp/fhir_arrow_test_range_mid.ndjson", 9, 18)
+    var content = result[0]
+    var spans = result[1].copy()
+    assert_eq_int(len(spans), 1, "range should yield exactly 1 line")
+    assert_eq_str(_slice(content, spans[0]), '{"a": 2}', "range middle line")
+
+
+def test_read_ndjson_range_to_end_of_file_past_actual_size() raises:
+    """End_byte larger than the file's actual size is fine (mirrors read()
+    returning a short read at EOF, not an error) -- the planner's last
+    chunk uses a large/unbounded end_byte for exactly this reason."""
+    _write(
+        "/tmp/fhir_arrow_test_range_eof.ndjson",
+        '{"a": 1}\n{"a": 2}\n',
+    )
+    var result = read_ndjson_range(
+        "/tmp/fhir_arrow_test_range_eof.ndjson", 9, 1_000_000
+    )
+    var content = result[0]
+    var spans = result[1].copy()
+    assert_eq_int(len(spans), 1, "range should yield exactly the last line")
+    assert_eq_str(_slice(content, spans[0]), '{"a": 2}', "range last line")
+
+
+def test_read_ndjson_range_empty_range_raises() raises:
+    """A byte range with no non-blank lines in it (e.g. start == end) raises,
+    same contract as read_ndjson_lines on an empty file."""
+    _write(
+        "/tmp/fhir_arrow_test_range_empty.ndjson",
+        '{"a": 1}\n',
+    )
+    var raised = False
+    try:
+        _ = read_ndjson_range("/tmp/fhir_arrow_test_range_empty.ndjson", 0, 0)
+    except:
+        raised = True
+    assert_true(raised, "empty byte range should raise")
+
+
 def main() raises:
     test_find_line_spans_offsets_correct()
     print("PASS test_find_line_spans_offsets_correct")
@@ -159,5 +223,17 @@ def main() raises:
 
     test_read_ndjson_lines_does_not_reject_invalid_json()
     print("PASS test_read_ndjson_lines_does_not_reject_invalid_json")
+
+    test_read_ndjson_range_reads_only_the_given_bytes()
+    print("PASS test_read_ndjson_range_reads_only_the_given_bytes")
+
+    test_read_ndjson_range_middle_chunk()
+    print("PASS test_read_ndjson_range_middle_chunk")
+
+    test_read_ndjson_range_to_end_of_file_past_actual_size()
+    print("PASS test_read_ndjson_range_to_end_of_file_past_actual_size")
+
+    test_read_ndjson_range_empty_range_raises()
+    print("PASS test_read_ndjson_range_empty_range_raises")
 
     print("\nAll ndjson tests passed.")

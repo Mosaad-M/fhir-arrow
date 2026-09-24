@@ -11,7 +11,7 @@ from arrow import (
     encode_arrow_file, decode_arrow_file,
 )
 from flatbuffers import write_i32_le, write_f64_le
-from ndjson import read_ndjson_lines
+from ndjson import read_ndjson_lines, read_ndjson_range
 from resources import PatientRow, ObservationRow, ConditionRow
 from fast_shred import (
     shred_patient_fast, shred_observation_fast, shred_condition_fast,
@@ -367,37 +367,44 @@ def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raise
 
 
 def ndjson_range_to_feather(
-    ndjson_path: String, out_path: String, kind: String, start_idx: Int, end_idx: Int
+    ndjson_path: String, out_path: String, kind: String, start_byte: Int, end_byte: Int
 ) raises:
-    """Same as ndjson_to_feather, but only shreds spans in [start_idx,
-    end_idx) instead of the whole file. Used by the parallel path: one
-    process per chunk of the line-span list, each producing its own
+    """Same as ndjson_to_feather, but reads only the byte range [start_byte,
+    end_byte) of the file (via read_ndjson_range: seek+read, not a whole-file
+    read) and shreds just the lines found in it. Used by the parallel path:
+    one process per byte-range chunk (boundaries computed once, up front, by
+    chunk_planner.mojo -- NOT recomputed per worker), each producing its own
     Feather file, later combined by merge_feathers into one file with
-    multiple RecordBatches (row order preserved by chunk order)."""
-    var result = read_ndjson_lines(ndjson_path)
+    multiple RecordBatches (row order preserved by chunk order).
+
+    An earlier version of this function took a (start_idx, end_idx) row-index
+    range into the FULL file's span list, which required every worker to
+    read_ndjson_lines the WHOLE file to compute that list -- measured
+    directly: 8 workers each redundantly paying the full-file read+scan cost
+    made an 8-worker Observation run slower than sequential (4748ms vs
+    2132ms). This byte-range version is what actually gets each worker's
+    cost to scale with its own chunk size instead of the whole file."""
+    var result = read_ndjson_range(ndjson_path, start_byte, end_byte)
     var content = result[0]
-    var all_spans = result[1].copy()
+    var spans = result[1].copy()
     var b = content.as_bytes()
 
-    var lo = max(0, min(start_idx, len(all_spans)))
-    var hi = max(lo, min(end_idx, len(all_spans)))
-
     if kind == "Patient":
-        var rows = List[PatientRow](capacity=hi - lo)
-        for i in range(lo, hi):
-            var span = all_spans[i]
+        var rows = List[PatientRow](capacity=len(spans))
+        for i in range(len(spans)):
+            var span = spans[i]
             rows.append(shred_patient_fast(b[span[0] : span[1]]))
         patients_to_feather(rows, out_path)
     elif kind == "Observation":
-        var rows = List[ObservationRow](capacity=hi - lo)
-        for i in range(lo, hi):
-            var span = all_spans[i]
+        var rows = List[ObservationRow](capacity=len(spans))
+        for i in range(len(spans)):
+            var span = spans[i]
             rows.append(shred_observation_fast(b[span[0] : span[1]]))
         observations_to_feather(rows, out_path)
     elif kind == "Condition":
-        var rows = List[ConditionRow](capacity=hi - lo)
-        for i in range(lo, hi):
-            var span = all_spans[i]
+        var rows = List[ConditionRow](capacity=len(spans))
+        for i in range(len(spans)):
+            var span = spans[i]
             rows.append(shred_condition_fast(b[span[0] : span[1]]))
         conditions_to_feather(rows, out_path)
     else:
