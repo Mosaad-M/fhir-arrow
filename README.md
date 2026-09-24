@@ -228,6 +228,40 @@ comfortable win is Patient's, where per-record fixed overhead (six-plus
 independent re-scans down to one) dominated more heavily relative to total
 work per record.
 
+### Phase A: zero-copy line reading (current)
+
+`read_ndjson_lines` used to split the whole file into one owned `String`
+per line (`content.split("\n")` plus an explicit copy of each survivor) —
+for the 266,750-row Observation file, ~266K String allocations before
+`fast_shred` ever ran. It now reads the file once and returns `(content,
+spans)`, where `spans` is a list of `(start, end)` byte offsets into that
+one buffer; `shred_patient_fast`/`shred_observation_fast`/
+`shred_condition_fast` take a byte `Span` slice of it directly instead of
+an owned line `String`, so no per-line allocation happens at all.
+
+The first attempt at this was, surprisingly, *slower* than v2 — a
+hand-rolled `while i < n: if b[i] == LF: ...` scan over the byte buffer
+turned out to be roughly 25x slower than Mojo's stdlib `String.find()`
+used in a loop (measured directly: ~450ms vs ~17ms for the same
+266,750-line scan), evidently because the stdlib search is vectorized and
+a naive per-byte `Span` index loop isn't. Fixed by using `.find()` instead
+of a manual scan; the "zero per-line allocation" property is unaffected,
+since `.find()` only searches, it doesn't allocate. Full writeup in
+`tasks/lessons.md`.
+
+Same dataset, same machine, re-run back to back:
+
+| Resource | Mojo (Phase A) | Python | A vs v2 | A vs Python |
+|---|---|---|---|---|
+| Patient (577 rows) | 5.7 ms, 100,909 rows/sec | 23.6 ms, 24,402 rows/sec | ~1.03x faster | **Mojo 4.13x faster** |
+| Observation (266,750 rows) | 2,155.8 ms, 123,735 rows/sec | 2,511.6 ms, 106,208 rows/sec | ~1.04x faster | **Mojo 1.17x faster** |
+| Condition (19,025 rows) | 147.0 ms, 129,464 rows/sec | 152.7 ms, 124,573 rows/sec | ~flat vs v2 (noise-level on 19K rows) | **Mojo 1.04x faster** |
+
+A modest, real improvement over v2 on Patient/Observation; Condition is
+within run-to-run noise at this row count. Next: phase B (an escape-free
+fast path in `_extract_string`) and phase C (the remaining buffer-growth
+cleanup in `build_float64_column`/`build_bool_column`).
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars cannot currently open the `.feather` files
