@@ -35,7 +35,7 @@ def test_find_line_spans_offsets_correct() raises:
     """(start, end) pairs must point at exactly the right bytes in the
     original buffer, not just be the right count."""
     var content = String('{"a": 1}\n{"a": 22}\n')
-    var spans = find_line_spans(content.as_bytes())
+    var spans = find_line_spans(content)
     assert_eq_int(len(spans), 2, "span count")
     assert_eq_str(_slice(content, spans[0]), '{"a": 1}', "span 0 text")
     assert_eq_str(_slice(content, spans[1]), '{"a": 22}', "span 1 text")
@@ -43,7 +43,7 @@ def test_find_line_spans_offsets_correct() raises:
 
 def test_find_line_spans_skips_blank_lines() raises:
     var content = String('{"a": 1}\n\n{"a": 2}\n\n')
-    var spans = find_line_spans(content.as_bytes())
+    var spans = find_line_spans(content)
     assert_eq_int(len(spans), 2, "span count")
     assert_eq_str(_slice(content, spans[0]), '{"a": 1}', "span 0 text")
     assert_eq_str(_slice(content, spans[1]), '{"a": 2}', "span 1 text")
@@ -54,20 +54,20 @@ def test_find_line_spans_no_trailing_newline() raises:
     line's span (mirrors read_text's raw content, no assumption of a
     final newline)."""
     var content = String('{"a": 1}\n{"a": 2}')
-    var spans = find_line_spans(content.as_bytes())
+    var spans = find_line_spans(content)
     assert_eq_int(len(spans), 2, "span count")
     assert_eq_str(_slice(content, spans[1]), '{"a": 2}', "span 1 text")
 
 
 def test_find_line_spans_empty_buffer_yields_no_spans() raises:
     var content = String("")
-    var spans = find_line_spans(content.as_bytes())
+    var spans = find_line_spans(content)
     assert_eq_int(len(spans), 0, "span count")
 
 
 def test_find_line_spans_all_blank_yields_no_spans() raises:
     var content = String("\n\n\n")
-    var spans = find_line_spans(content.as_bytes())
+    var spans = find_line_spans(content)
     assert_eq_int(len(spans), 0, "span count")
 
 
