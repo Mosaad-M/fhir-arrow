@@ -39,13 +39,20 @@ def _pack_bits(bits: List[Bool]) -> List[UInt8]:
 
 
 def build_string_column(values: List[Optional[String]]) raises -> ArrowArray:
-    """Nullable Utf8 column from a list of optional strings."""
+    """Nullable Utf8 column from a list of optional strings.
+
+    value_bytes is pre-sized once (total byte length computed up front)
+    and filled via indexed writes rather than growing via `.append()` in
+    a loop — the fix for the buffer-growth cost the v0 benchmark
+    identified as one of the two dominant slowdowns versus Python."""
     var length = len(values)
     var null_bits = List[Bool]()
     var null_count = 0
+    var total_bytes = 0
     for i in range(length):
         if values[i]:
             null_bits.append(True)
+            total_bytes += len(values[i].value().as_bytes())
         else:
             null_bits.append(False)
             null_count += 1
@@ -60,13 +67,17 @@ def build_string_column(values: List[Optional[String]]) raises -> ArrowArray:
     write_i32_le(offsets, 0, Int32(0))
 
     var value_bytes = List[UInt8]()
+    for _ in range(total_bytes):
+        value_bytes.append(UInt8(0))
+
     var cur = 0
     for i in range(length):
         if values[i]:
             var sb = values[i].value().as_bytes()
-            for j in range(len(sb)):
-                value_bytes.append(sb[j])
-            cur += len(sb)
+            var n = len(sb)
+            for j in range(n):
+                value_bytes[cur + j] = sb[j]
+            cur += n
         write_i32_le(offsets, (i + 1) * 4, Int32(cur))
 
     return ArrowArray(
