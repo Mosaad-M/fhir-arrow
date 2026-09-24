@@ -1,4 +1,4 @@
-from resources import PatientRow, shred_patient
+from resources import PatientRow, shred_patient, ObservationRow, shred_observation
 from json import parse_json
 
 
@@ -10,6 +10,16 @@ def assert_true(cond: Bool, msg: String) raises:
 def assert_eq_str(a: String, b: String, msg: String) raises:
     if a != b:
         raise Error("FAIL: " + msg + ", got '" + a + "', expected '" + b + "'")
+
+
+def assert_near(a: Float64, b: Float64, msg: String) raises:
+    var diff = a - b
+    if diff < 0:
+        diff = -diff
+    if diff > 1e-9:
+        raise Error(
+            "FAIL: " + msg + ", got " + String(a) + ", expected " + String(b)
+        )
 
 
 # ── Patient ──────────────────────────────────────────────────────────────────
@@ -58,6 +68,67 @@ def test_shred_patient_missing_id_raises() raises:
     assert_true(raised, "missing id should raise")
 
 
+# ── Observation ──────────────────────────────────────────────────────────────
+
+
+def test_shred_observation_value_quantity() raises:
+    """valueQuantity populates value_quantity/value_unit; value_string stays null."""
+    var obj = parse_json(
+        '{"id": "o1", "status": "final",'
+        ' "subject": {"reference": "Patient/p1"},'
+        ' "code": {"coding": [{"system": "http://loinc.org", "code": "4548-4",'
+        ' "display": "Hemoglobin A1c"}]},'
+        ' "effectiveDateTime": "2024-01-01T00:00:00Z",'
+        ' "valueQuantity": {"value": 5.4, "unit": "%"}}'
+    )
+    var row = shred_observation(obj)
+    assert_eq_str(row.id, "o1", "id")
+    assert_eq_str(row.patient_ref.value(), "Patient/p1", "patient_ref")
+    assert_eq_str(row.code.value(), "4548-4", "code")
+    assert_eq_str(row.code_system.value(), "http://loinc.org", "code_system")
+    assert_eq_str(row.code_display.value(), "Hemoglobin A1c", "code_display")
+    assert_eq_str(row.status.value(), "final", "status")
+    assert_eq_str(
+        row.effective_datetime.value(),
+        "2024-01-01T00:00:00Z",
+        "effective_datetime",
+    )
+    assert_near(row.value_quantity.value(), 5.4, "value_quantity")
+    assert_eq_str(row.value_unit.value(), "%", "value_unit")
+    assert_true(not row.value_string, "value_string should be null")
+
+
+def test_shred_observation_value_string() raises:
+    """valueString populates value_string; value_quantity/value_unit stay null."""
+    var obj = parse_json(
+        '{"id": "o2", "code": {"coding": [{"code": "obs-note"}]},'
+        ' "valueString": "no acute findings"}'
+    )
+    var row = shred_observation(obj)
+    assert_eq_str(row.value_string.value(), "no acute findings", "value_string")
+    assert_true(not row.value_quantity, "value_quantity should be null")
+    assert_true(not row.value_unit, "value_unit should be null")
+
+
+def test_shred_observation_no_value() raises:
+    """An Observation with neither valueQuantity nor valueString shreds cleanly (no crash), both value columns null."""
+    var obj = parse_json('{"id": "o3", "code": {"coding": [{"code": "x"}]}}')
+    var row = shred_observation(obj)
+    assert_true(not row.value_quantity, "value_quantity should be null")
+    assert_true(not row.value_string, "value_string should be null")
+
+
+def test_shred_observation_missing_id_raises() raises:
+    """id is required for Observation too."""
+    var obj = parse_json('{"status": "final"}')
+    var raised = False
+    try:
+        _ = shred_observation(obj)
+    except:
+        raised = True
+    assert_true(raised, "missing id should raise")
+
+
 def main() raises:
     test_shred_patient_minimal()
     print("PASS test_shred_patient_minimal")
@@ -70,5 +141,17 @@ def main() raises:
 
     test_shred_patient_missing_id_raises()
     print("PASS test_shred_patient_missing_id_raises")
+
+    test_shred_observation_value_quantity()
+    print("PASS test_shred_observation_value_quantity")
+
+    test_shred_observation_value_string()
+    print("PASS test_shred_observation_value_string")
+
+    test_shred_observation_no_value()
+    print("PASS test_shred_observation_no_value")
+
+    test_shred_observation_missing_id_raises()
+    print("PASS test_shred_observation_missing_id_raises")
 
     print("\nAll resource tests passed.")
