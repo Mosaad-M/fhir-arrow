@@ -258,9 +258,32 @@ Same dataset, same machine, re-run back to back:
 | Condition (19,025 rows) | 147.0 ms, 129,464 rows/sec | 152.7 ms, 124,573 rows/sec | ~flat vs v2 (noise-level on 19K rows) | **Mojo 1.04x faster** |
 
 A modest, real improvement over v2 on Patient/Observation; Condition is
-within run-to-run noise at this row count. Next: phase B (an escape-free
-fast path in `_extract_string`) and phase C (the remaining buffer-growth
-cleanup in `build_float64_column`/`build_bool_column`).
+within run-to-run noise at this row count.
+
+### Phase B: escape-free fast path in `_extract_string`
+
+Most FHIR field values (ids, LOINC codes, ISO dates) never contain an
+escape. `_extract_string` now scans for the closing quote checking only
+for a backslash; when none is found, the string's exact length is already
+known, so the result buffer is pre-sized once and bulk-copied instead of
+growing via `.append()` per byte through the original escape-handling
+branches. Falls back to the original byte-by-byte decoder the moment a
+backslash is actually seen — output is unchanged either way (5 new direct
+tests plus all 45 prior `test_fast_shred.mojo`/`test_ndjson.mojo`/
+`test_fhir_arrow.mojo` cases confirm this).
+
+An isolated 2M-call micro-benchmark on a realistic ~57-byte display string
+shows a real ~30% per-call improvement (406ms vs 584ms for 2M calls, old
+vs new). The full `bench_fhir_arrow` run, however, shows **no measurable
+change** from Phase A's numbers — other per-record costs (`_find_keys`
+scanning, column building, Feather encoding, file I/O) apparently dominate
+total wall-clock time enough to swamp this one function's share entirely.
+Reporting both numbers rather than only the flattering one: the
+optimization is real, it's just not the bottleneck at this pipeline's
+current profile.
+
+Next: phase C (the remaining buffer-growth cleanup in
+`build_float64_column`/`build_bool_column`).
 
 ## Known limitations
 
