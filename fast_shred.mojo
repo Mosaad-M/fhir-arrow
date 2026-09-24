@@ -272,7 +272,36 @@ def _first_array_element(b: Span[UInt8, _], arr_start: Int) raises -> Optional[I
 
 
 def _extract_string(b: Span[UInt8, _], start: Int) raises -> String:
-    """start must point at the opening quote."""
+    """start must point at the opening quote.
+
+    Fast path: most FHIR field values (ids, LOINC codes, ISO dates) never
+    contain an escape. Scan for the closing quote checking only for a
+    backslash; if none is seen, the string's exact length is already known
+    (no escapes means byte count == char count), so the result buffer is
+    pre-sized once and bulk-copied in a second pass, instead of growing via
+    `.append()` on every byte the way the escape-handling loop below has
+    to. Falls back to the byte-by-byte escape-decoding loop the moment a
+    backslash is seen (same output as before this fast path existed — this
+    is a performance-only change, not a behavior change)."""
+    var n = len(b)
+    var j = start + 1
+    while j < n:
+        var c = b[j]
+        if c == _QUOTE:
+            var length = j - (start + 1)
+            var result = List[UInt8](capacity=length)
+            for k in range(start + 1, j):
+                result.append(b[k])
+            return String(unsafe_from_utf8=result^)
+        elif c == _BACKSLASH:
+            break
+        j += 1
+    return _extract_string_escaped(b, start)
+
+
+def _extract_string_escaped(b: Span[UInt8, _], start: Int) raises -> String:
+    """Byte-by-byte escape-decoding fallback for _extract_string, used once
+    a backslash has been seen. start must point at the opening quote."""
     var n = len(b)
     var i = start + 1
     var result = List[UInt8](capacity=32)

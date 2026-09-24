@@ -6,7 +6,7 @@
 # Section 3: adversarial cases the tree parser never had to worry about.
 
 from fast_shred import (
-    _skip_value, _find_key, _find_keys, _first_array_element,
+    _skip_value, _find_key, _find_keys, _first_array_element, _extract_string,
     shred_patient_fast, shred_observation_fast, shred_condition_fast,
 )
 
@@ -280,6 +280,51 @@ def test_first_array_element_skips_leading_whitespace() raises:
     assert_true(b[start.value()] == UInt8(ord('"')), "should point at the opening quote, past the leading space")
 
 
+# ── _extract_string: escape-free fast path (Phase B) ─────────────────────────
+# Most FHIR field values (ids, LOINC codes, ISO dates) never contain an
+# escape. These cases must all produce the exact same output as before the
+# fast path was added — this is a performance-only change.
+
+
+def test_extract_string_no_escape_fast_path() raises:
+    var s = String('"hello world"')
+    var b = s.as_bytes()
+    var v = _extract_string(b, 0)
+    assert_eq_str(v, "hello world", "no-escape string")
+
+
+def test_extract_string_with_escape_falls_back() raises:
+    var s = String('"a\\"quoted\\" word"')
+    var b = s.as_bytes()
+    var v = _extract_string(b, 0)
+    assert_eq_str(v, 'a"quoted" word', "escaped-quote string, decoded")
+
+
+def test_extract_string_empty() raises:
+    var s = String('""')
+    var b = s.as_bytes()
+    var v = _extract_string(b, 0)
+    assert_eq_str(v, "", "empty string")
+
+
+def test_extract_string_entirely_escapes() raises:
+    var s = String('"\\n\\t\\\\"')
+    var b = s.as_bytes()
+    var v = _extract_string(b, 0)
+    assert_eq_str(v, "\n\t\\", "string that is entirely escape sequences")
+
+
+def test_extract_string_no_escape_long() raises:
+    """Long enough to exceed the old fixed capacity=32 buffer, to prove
+    the fast path's bulk copy isn't just correct for short strings."""
+    var s = String(
+        '"' + "0123456789" * 5 + '"'
+    )
+    var b = s.as_bytes()
+    var v = _extract_string(b, 0)
+    assert_eq_str(v, "0123456789" * 5, "long no-escape string")
+
+
 # ── Section 2: shred_*_fast parity with test_resources.mojo ──────────────────
 # Same fixtures, same expected values, calling *_fast instead of the
 # json.mojo-tree-based originals.
@@ -546,6 +591,17 @@ def main() raises:
     print("PASS test_first_array_element_of_objects")
     test_first_array_element_skips_leading_whitespace()
     print("PASS test_first_array_element_skips_leading_whitespace")
+
+    test_extract_string_no_escape_fast_path()
+    print("PASS test_extract_string_no_escape_fast_path")
+    test_extract_string_with_escape_falls_back()
+    print("PASS test_extract_string_with_escape_falls_back")
+    test_extract_string_empty()
+    print("PASS test_extract_string_empty")
+    test_extract_string_entirely_escapes()
+    print("PASS test_extract_string_entirely_escapes")
+    test_extract_string_no_escape_long()
+    print("PASS test_extract_string_no_escape_long")
 
     test_shred_patient_fast_minimal()
     print("PASS test_shred_patient_fast_minimal")
