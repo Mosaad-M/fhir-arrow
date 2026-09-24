@@ -137,3 +137,199 @@ def build_bool_column(values: List[Optional[Bool]]) raises -> ArrowArray:
     return ArrowArray(
         ArrowType.bool_(), length, null_count, validity, List[UInt8](), value_bytes
     )
+
+
+# ── Patient: schema + RecordBatch assembly ───────────────────────────────────
+
+
+def patient_schema() -> ArrowSchema:
+    var fields = List[ArrowField]()
+    fields.append(ArrowField("id", ArrowType.utf8(), False))
+    fields.append(ArrowField("gender", ArrowType.utf8(), True))
+    fields.append(ArrowField("birth_date", ArrowType.utf8(), True))
+    fields.append(ArrowField("family_name", ArrowType.utf8(), True))
+    fields.append(ArrowField("given_name", ArrowType.utf8(), True))
+    fields.append(ArrowField("deceased", ArrowType.bool_(), True))
+    return ArrowSchema(fields, Int16(0))
+
+
+def patients_to_record_batch(rows: List[PatientRow]) raises -> RecordBatch:
+    var ids = List[String]()
+    var genders = List[Optional[String]]()
+    var birth_dates = List[Optional[String]]()
+    var family_names = List[Optional[String]]()
+    var given_names = List[Optional[String]]()
+    var deceased = List[Optional[Bool]]()
+    for i in range(len(rows)):
+        ids.append(rows[i].id)
+        genders.append(rows[i].gender)
+        birth_dates.append(rows[i].birth_date)
+        family_names.append(rows[i].family_name)
+        given_names.append(rows[i].given_name)
+        deceased.append(rows[i].deceased)
+
+    var arrays = List[ArrowArray]()
+    arrays.append(build_required_string_column(ids))
+    arrays.append(build_string_column(genders))
+    arrays.append(build_string_column(birth_dates))
+    arrays.append(build_string_column(family_names))
+    arrays.append(build_string_column(given_names))
+    arrays.append(build_bool_column(deceased))
+    return RecordBatch(Int64(len(rows)), arrays)
+
+
+def patients_to_feather(rows: List[PatientRow], path: String) raises:
+    var schema = patient_schema()
+    var batch = patients_to_record_batch(rows)
+    var batches = List[RecordBatch]()
+    batches.append(batch^)
+    var file_bytes = encode_arrow_file(schema, batches)
+    Path(path).write_bytes(file_bytes)
+
+
+# ── Observation: schema + RecordBatch assembly ───────────────────────────────
+
+
+def observation_schema() -> ArrowSchema:
+    var fields = List[ArrowField]()
+    fields.append(ArrowField("id", ArrowType.utf8(), False))
+    fields.append(ArrowField("patient_ref", ArrowType.utf8(), True))
+    fields.append(ArrowField("code", ArrowType.utf8(), True))
+    fields.append(ArrowField("code_system", ArrowType.utf8(), True))
+    fields.append(ArrowField("code_display", ArrowType.utf8(), True))
+    fields.append(ArrowField("status", ArrowType.utf8(), True))
+    fields.append(ArrowField("effective_datetime", ArrowType.utf8(), True))
+    fields.append(ArrowField("value_quantity", ArrowType.float_(2), True))
+    fields.append(ArrowField("value_unit", ArrowType.utf8(), True))
+    fields.append(ArrowField("value_string", ArrowType.utf8(), True))
+    return ArrowSchema(fields, Int16(0))
+
+
+def observations_to_record_batch(rows: List[ObservationRow]) raises -> RecordBatch:
+    var ids = List[String]()
+    var patient_refs = List[Optional[String]]()
+    var codes = List[Optional[String]]()
+    var code_systems = List[Optional[String]]()
+    var code_displays = List[Optional[String]]()
+    var statuses = List[Optional[String]]()
+    var effective_datetimes = List[Optional[String]]()
+    var value_quantities = List[Optional[Float64]]()
+    var value_units = List[Optional[String]]()
+    var value_strings = List[Optional[String]]()
+    for i in range(len(rows)):
+        ids.append(rows[i].id)
+        patient_refs.append(rows[i].patient_ref)
+        codes.append(rows[i].code)
+        code_systems.append(rows[i].code_system)
+        code_displays.append(rows[i].code_display)
+        statuses.append(rows[i].status)
+        effective_datetimes.append(rows[i].effective_datetime)
+        value_quantities.append(rows[i].value_quantity)
+        value_units.append(rows[i].value_unit)
+        value_strings.append(rows[i].value_string)
+
+    var arrays = List[ArrowArray]()
+    arrays.append(build_required_string_column(ids))
+    arrays.append(build_string_column(patient_refs))
+    arrays.append(build_string_column(codes))
+    arrays.append(build_string_column(code_systems))
+    arrays.append(build_string_column(code_displays))
+    arrays.append(build_string_column(statuses))
+    arrays.append(build_string_column(effective_datetimes))
+    arrays.append(build_float64_column(value_quantities))
+    arrays.append(build_string_column(value_units))
+    arrays.append(build_string_column(value_strings))
+    return RecordBatch(Int64(len(rows)), arrays)
+
+
+def observations_to_feather(rows: List[ObservationRow], path: String) raises:
+    var schema = observation_schema()
+    var batch = observations_to_record_batch(rows)
+    var batches = List[RecordBatch]()
+    batches.append(batch^)
+    var file_bytes = encode_arrow_file(schema, batches)
+    Path(path).write_bytes(file_bytes)
+
+
+# ── Condition: schema + RecordBatch assembly ─────────────────────────────────
+
+
+def condition_schema() -> ArrowSchema:
+    var fields = List[ArrowField]()
+    fields.append(ArrowField("id", ArrowType.utf8(), False))
+    fields.append(ArrowField("patient_ref", ArrowType.utf8(), True))
+    fields.append(ArrowField("code", ArrowType.utf8(), True))
+    fields.append(ArrowField("code_display", ArrowType.utf8(), True))
+    fields.append(ArrowField("clinical_status", ArrowType.utf8(), True))
+    fields.append(ArrowField("onset_datetime", ArrowType.utf8(), True))
+    fields.append(ArrowField("recorded_date", ArrowType.utf8(), True))
+    return ArrowSchema(fields, Int16(0))
+
+
+def conditions_to_record_batch(rows: List[ConditionRow]) raises -> RecordBatch:
+    var ids = List[String]()
+    var patient_refs = List[Optional[String]]()
+    var codes = List[Optional[String]]()
+    var code_displays = List[Optional[String]]()
+    var clinical_statuses = List[Optional[String]]()
+    var onset_datetimes = List[Optional[String]]()
+    var recorded_dates = List[Optional[String]]()
+    for i in range(len(rows)):
+        ids.append(rows[i].id)
+        patient_refs.append(rows[i].patient_ref)
+        codes.append(rows[i].code)
+        code_displays.append(rows[i].code_display)
+        clinical_statuses.append(rows[i].clinical_status)
+        onset_datetimes.append(rows[i].onset_datetime)
+        recorded_dates.append(rows[i].recorded_date)
+
+    var arrays = List[ArrowArray]()
+    arrays.append(build_required_string_column(ids))
+    arrays.append(build_string_column(patient_refs))
+    arrays.append(build_string_column(codes))
+    arrays.append(build_string_column(code_displays))
+    arrays.append(build_string_column(clinical_statuses))
+    arrays.append(build_string_column(onset_datetimes))
+    arrays.append(build_string_column(recorded_dates))
+    return RecordBatch(Int64(len(rows)), arrays)
+
+
+def conditions_to_feather(rows: List[ConditionRow], path: String) raises:
+    var schema = condition_schema()
+    var batch = conditions_to_record_batch(rows)
+    var batches = List[RecordBatch]()
+    batches.append(batch^)
+    var file_bytes = encode_arrow_file(schema, batches)
+    Path(path).write_bytes(file_bytes)
+
+
+# ── End-to-end orchestration ──────────────────────────────────────────────────
+
+
+def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raises:
+    """Read a Bulk FHIR NDJSON export file of one resource type and write a
+    Feather file of its shredded columns. `kind` is one of "Patient",
+    "Observation", "Condition"."""
+    var records = read_ndjson(ndjson_path)
+
+    if kind == "Patient":
+        var rows = List[PatientRow]()
+        for i in range(len(records)):
+            rows.append(shred_patient(records[i]))
+        patients_to_feather(rows, out_path)
+    elif kind == "Observation":
+        var rows = List[ObservationRow]()
+        for i in range(len(records)):
+            rows.append(shred_observation(records[i]))
+        observations_to_feather(rows, out_path)
+    elif kind == "Condition":
+        var rows = List[ConditionRow]()
+        for i in range(len(records)):
+            rows.append(shred_condition(records[i]))
+        conditions_to_feather(rows, out_path)
+    else:
+        raise Error(
+            "fhir_arrow: ndjson_to_feather: unknown resource kind '"
+            + kind
+            + "' (expected Patient, Observation, or Condition)"
+        )

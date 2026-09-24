@@ -1,0 +1,3 @@
+{"resourceType": "Patient", "id": "p1", "gender": "female", "birthDate": "1990-01-01", "name": [{"family": "Smith", "given": ["Jane", "Q"]}], "deceasedBoolean": false}
+{"resourceType": "Patient", "id": "p2", "gender": "male", "birthDate": "1985-06-15"}
+{"resourceType": "Patient", "id": "p3", "gender": "female", "birthDate": "1972-11-30", "name": [{"family": "Doe", "given": ["Alice"]}], "deceasedBoolean": true}

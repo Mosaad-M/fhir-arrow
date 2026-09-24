@@ -1,0 +1,3 @@
+{"resourceType": "Observation", "id": "o1", "status": "final", "subject": {"reference": "Patient/p1"}, "code": {"coding": [{"system": "http://loinc.org", "code": "4548-4", "display": "Hemoglobin A1c"}]}, "effectiveDateTime": "2024-01-01T00:00:00Z", "valueQuantity": {"value": 5.4, "unit": "%"}}
+{"resourceType": "Observation", "id": "o2", "status": "final", "subject": {"reference": "Patient/p2"}, "code": {"coding": [{"code": "obs-note"}]}, "valueString": "no acute findings"}
+{"resourceType": "Observation", "id": "o3", "status": "preliminary", "subject": {"reference": "Patient/p3"}, "code": {"coding": [{"code": "8302-2", "display": "Body height"}]}, "valueQuantity": {"value": 165.0, "unit": "cm"}}
