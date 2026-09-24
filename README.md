@@ -179,7 +179,7 @@ what Mojo can do here:
    `List.append` in a loop, with no capacity pre-reservation, versus
    pandas/pyarrow's vectorized C++ internals.
 
-### v1: zero-tree byte scanner + pre-sized buffers (current)
+### v1: zero-tree byte scanner + pre-sized buffers (superseded)
 
 Fixed both: `fast_shred.mojo` replaced the `json.mojo`-tree path with a
 hand-rolled scanner that never builds a tree at all (see Architecture
@@ -193,19 +193,40 @@ total-byte-length pass and writes via indexed assignment instead of
 | Observation (266,750 rows) | 2,702.6 ms, 98,700 rows/sec | 2,504.0 ms, 106,529 rows/sec | 2.01x faster | Python 1.08x faster |
 | Condition (19,025 rows) | 184.1 ms, 103,347 rows/sec | 154.6 ms, 123,040 rows/sec | 2.12x faster | Python 1.19x faster |
 
-**Honest result: Patient now beats Python outright. Observation and
-Condition improved ~2x over v0 but still trail Python by 8-19%, the gap
-narrowed a lot, it didn't fully close.** Reporting this as measured, not
-rounded off. The most likely remaining cost, based on the v0 diagnosis
-holding directionally: `_find_key` re-scans an object's keys from the start
-for each field it's asked to find (a handful of independent linear scans
-per record rather than one true single pass collecting every wanted field
-in one traversal), and CPython's `json` module is still doing raw parsing
-in optimized C that a byte-level scan in Mojo has to out-throughput, not
-just out-allocate, to fully win on the larger/more field-heavy resource
-types. A genuinely single-pass, multi-key scanner is the natural next
-optimization if closing this the rest of the way matters more than the
-Patient result already achieved.
+Patient beat Python outright at this point. Observation and Condition
+improved ~2x over v0 but still trailed Python by 8-19%. Root cause: `_find_key`
+re-scanned an object's keys from the start for each field it was asked to
+find, one independent linear scan per field, rather than collecting every
+wanted field in a single traversal.
+
+### v2: single-pass `_find_keys` (current)
+
+Added `_find_keys`, which walks an object's direct keys once and resolves
+an arbitrary set of wanted sibling keys in that one pass (early-exiting once
+every slot is filled), instead of one `_find_key` call — and one full
+re-scan — per field. Replaced every site that issued 2+ `_find_key` calls
+against the same object (Patient's 5 top-level fields + `name[0]`'s 2;
+Observation's 7 top-level fields + `coding[0]`'s 3 + `valueQuantity`'s 2;
+Condition's 6 top-level fields + `coding[0]`'s 2) with a single `_find_keys`
+call each. Genuinely single-key-per-level lookups (`subject.reference`,
+`code.coding`, `clinicalStatus.coding`) were left on `_find_key` — they were
+never the waste. Same dataset, same machine, re-run back to back (each
+number is the average of 2 stable back-to-back runs, after discarding one
+cold-cache Python run that included first-import overhead):
+
+| Resource | Mojo (v2) | Python | v2 vs v1 | v2 vs Python |
+|---|---|---|---|---|
+| Patient (577 rows) | 5.9 ms, 97,591 rows/sec | 22.4 ms, 25,709 rows/sec | 1.76x faster | **Mojo 3.79x faster** |
+| Observation (266,750 rows) | 2,248.8 ms, 118,621 rows/sec | 2,489.0 ms, 107,174 rows/sec | 1.20x faster | **Mojo 1.11x faster** |
+| Condition (19,025 rows) | 146.3 ms, 130,072 rows/sec | 153.5 ms, 123,987 rows/sec | 1.26x faster | **Mojo 1.05x faster** |
+
+**All three resource types now beat Python.** The margin on Observation and
+Condition is real but not large (5-11%) — reported as measured, not rounded
+up. It's close enough that a differently-shaped dataset or a slower/faster
+`pandas`/`pyarrow` version could plausibly flip it back on those two; the
+comfortable win is Patient's, where per-record fixed overhead (six-plus
+independent re-scans down to one) dominated more heavily relative to total
+work per record.
 
 ## Known limitations
 
