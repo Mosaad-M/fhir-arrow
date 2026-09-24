@@ -9,8 +9,10 @@ install = "mojo-pkg install"
 test-ndjson = "bash -c 'mojo run $(cat .mojo_flags 2>/dev/null) test_ndjson.mojo'"
 test-fast-shred = "bash -c 'mojo run $(cat .mojo_flags 2>/dev/null) test_fast_shred.mojo'"
 test-fhir-arrow = "bash -c 'mojo run $(cat .mojo_flags 2>/dev/null) test_fhir_arrow.mojo'"
+test-parallel = "bash -c 'mojo run $(cat .mojo_flags 2>/dev/null) test_parallel.mojo'"
 bench-fhir-arrow = "bash -c 'mojo run $(cat .mojo_flags 2>/dev/null) bench_fhir_arrow.mojo'"
 format = "mblack ndjson.mojo resources.mojo fast_shred.mojo fhir_arrow.mojo test_ndjson.mojo test_fast_shred.mojo test_fhir_arrow.mojo"
 
 [dependencies]
 mojo = ">=1.0.0"
+max = ">=26.5.0,<27"

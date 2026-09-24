@@ -8,7 +8,7 @@
 from std.pathlib import Path
 from arrow import (
     ArrowType, ArrowField, ArrowSchema, ArrowArray, RecordBatch,
-    encode_arrow_file,
+    encode_arrow_file, decode_arrow_file,
 )
 from flatbuffers import write_i32_le, write_f64_le
 from ndjson import read_ndjson_lines
@@ -364,3 +364,72 @@ def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raise
             + kind
             + "' (expected Patient, Observation, or Condition)"
         )
+
+
+def ndjson_range_to_feather(
+    ndjson_path: String, out_path: String, kind: String, start_idx: Int, end_idx: Int
+) raises:
+    """Same as ndjson_to_feather, but only shreds spans in [start_idx,
+    end_idx) instead of the whole file. Used by the parallel path: one
+    process per chunk of the line-span list, each producing its own
+    Feather file, later combined by merge_feathers into one file with
+    multiple RecordBatches (row order preserved by chunk order)."""
+    var result = read_ndjson_lines(ndjson_path)
+    var content = result[0]
+    var all_spans = result[1].copy()
+    var b = content.as_bytes()
+
+    var lo = max(0, min(start_idx, len(all_spans)))
+    var hi = max(lo, min(end_idx, len(all_spans)))
+
+    if kind == "Patient":
+        var rows = List[PatientRow](capacity=hi - lo)
+        for i in range(lo, hi):
+            var span = all_spans[i]
+            rows.append(shred_patient_fast(b[span[0] : span[1]]))
+        patients_to_feather(rows, out_path)
+    elif kind == "Observation":
+        var rows = List[ObservationRow](capacity=hi - lo)
+        for i in range(lo, hi):
+            var span = all_spans[i]
+            rows.append(shred_observation_fast(b[span[0] : span[1]]))
+        observations_to_feather(rows, out_path)
+    elif kind == "Condition":
+        var rows = List[ConditionRow](capacity=hi - lo)
+        for i in range(lo, hi):
+            var span = all_spans[i]
+            rows.append(shred_condition_fast(b[span[0] : span[1]]))
+        conditions_to_feather(rows, out_path)
+    else:
+        raise Error(
+            "fhir_arrow: ndjson_range_to_feather: unknown resource kind '"
+            + kind
+            + "' (expected Patient, Observation, or Condition)"
+        )
+
+
+def merge_feathers(paths: List[String], out_path: String) raises:
+    """Combine N Feather files (same schema, produced by ndjson_range_to_feather
+    for consecutive, ordered chunks) into ONE Feather file containing all of
+    their RecordBatches, in the same order as `paths`. Arrow's IPC file
+    format natively supports multiple RecordBatches per file, so this is a
+    concatenation of batches, not a byte-level merge or a re-shred: each
+    chunk file is decoded once and its batches are carried over unchanged."""
+    if len(paths) == 0:
+        raise Error("fhir_arrow: merge_feathers: no input paths given")
+
+    var first_bytes = Path(paths[0]).read_bytes()
+    var first_result = decode_arrow_file(first_bytes)
+    var schema = first_result[0].copy()
+    var all_batches = List[RecordBatch]()
+    for b in first_result[1].copy():
+        all_batches.append(b.copy())
+
+    for i in range(1, len(paths)):
+        var file_bytes = Path(paths[i]).read_bytes()
+        var result = decode_arrow_file(file_bytes)
+        for b in result[1].copy():
+            all_batches.append(b.copy())
+
+    var merged_bytes = encode_arrow_file(schema, all_batches)
+    Path(out_path).write_bytes(merged_bytes)

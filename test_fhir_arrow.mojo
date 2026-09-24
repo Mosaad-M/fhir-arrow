@@ -1,7 +1,7 @@
 from fhir_arrow import (
     build_string_column, build_required_string_column,
     build_float64_column, build_bool_column,
-    ndjson_to_feather,
+    ndjson_to_feather, ndjson_range_to_feather, merge_feathers,
 )
 from arrow import (
     ArrowType, ArrowField, ArrowSchema, ArrowArray, RecordBatch,
@@ -207,6 +207,147 @@ def test_ndjson_to_feather_condition_end_to_end() raises:
     assert_true(not _is_valid(onset_col, 1), "row 1 onset_datetime should be null")
 
 
+def test_ndjson_range_to_feather_produces_subset() raises:
+    """Ndjson_range_to_feather([0, 2)) on a 3-row fixture writes only rows 0-1."""
+    ndjson_range_to_feather(
+        "fixtures/patients_small.ndjson",
+        "/tmp/fhir_arrow_patients_range01.feather",
+        "Patient",
+        0,
+        2,
+    )
+    var file_bytes = Path("/tmp/fhir_arrow_patients_range01.feather").read_bytes()
+    var result = decode_arrow_file(file_bytes)
+    var batches = result[1].copy()
+    assert_eq_int(Int(batches[0].length), 2, "range [0,2) row count")
+    var id_col = batches[0].columns[0].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "p1", "range row 0 id")
+    assert_eq_str(_get_utf8(id_col, 1), "p2", "range row 1 id")
+
+
+def test_merge_feathers_combines_in_order() raises:
+    """Two range-chunk Feather files merge into one file with all rows, chunk order preserved."""
+    ndjson_range_to_feather(
+        "fixtures/patients_small.ndjson",
+        "/tmp/fhir_arrow_patients_chunk0.feather",
+        "Patient",
+        0,
+        2,
+    )
+    ndjson_range_to_feather(
+        "fixtures/patients_small.ndjson",
+        "/tmp/fhir_arrow_patients_chunk1.feather",
+        "Patient",
+        2,
+        3,
+    )
+    var paths = List[String]()
+    paths.append("/tmp/fhir_arrow_patients_chunk0.feather")
+    paths.append("/tmp/fhir_arrow_patients_chunk1.feather")
+    merge_feathers(paths, "/tmp/fhir_arrow_patients_merged.feather")
+
+    var file_bytes = Path("/tmp/fhir_arrow_patients_merged.feather").read_bytes()
+    var result = decode_arrow_file(file_bytes)
+    var batches = result[1].copy()
+    assert_eq_int(len(batches), 2, "merged file should carry 2 RecordBatches")
+    assert_eq_int(Int(batches[0].length), 2, "batch 0 row count")
+    assert_eq_int(Int(batches[1].length), 1, "batch 1 row count")
+
+    var id_col0 = batches[0].columns[0].copy()
+    var id_col1 = batches[1].columns[0].copy()
+    assert_eq_str(_get_utf8(id_col0, 0), "p1", "merged batch0 row0 id")
+    assert_eq_str(_get_utf8(id_col0, 1), "p2", "merged batch0 row1 id")
+    assert_eq_str(_get_utf8(id_col1, 0), "p3", "merged batch1 row0 id")
+
+
+def test_parallel_chunked_equivalent_to_sequential() raises:
+    """The explicit equivalence check the v2 performance-roadmap plan requires:
+    chunk+merge (the parallel path's building blocks) must produce identical
+    row values, in identical order, to the plain sequential ndjson_to_feather
+    on the same input."""
+    ndjson_to_feather(
+        "fixtures/patients_small.ndjson",
+        "/tmp/fhir_arrow_patients_sequential.feather",
+        "Patient",
+    )
+    ndjson_range_to_feather(
+        "fixtures/patients_small.ndjson",
+        "/tmp/fhir_arrow_patients_eqchunk0.feather",
+        "Patient",
+        0,
+        2,
+    )
+    ndjson_range_to_feather(
+        "fixtures/patients_small.ndjson",
+        "/tmp/fhir_arrow_patients_eqchunk1.feather",
+        "Patient",
+        2,
+        3,
+    )
+    var paths = List[String]()
+    paths.append("/tmp/fhir_arrow_patients_eqchunk0.feather")
+    paths.append("/tmp/fhir_arrow_patients_eqchunk1.feather")
+    merge_feathers(paths, "/tmp/fhir_arrow_patients_eqmerged.feather")
+
+    var seq_bytes = Path("/tmp/fhir_arrow_patients_sequential.feather").read_bytes()
+    var seq_result = decode_arrow_file(seq_bytes)
+    var seq_batches = seq_result[1].copy()
+    var seq_id_col = seq_batches[0].columns[0].copy()
+    var seq_family_col = seq_batches[0].columns[3].copy()
+    var seq_deceased_col = seq_batches[0].columns[5].copy()
+
+    var par_bytes = Path("/tmp/fhir_arrow_patients_eqmerged.feather").read_bytes()
+    var par_result = decode_arrow_file(par_bytes)
+    var par_batches = par_result[1].copy()
+
+    # Flatten the merged (multi-batch) output into one logical row sequence,
+    # in batch order, and compare against the sequential single-batch output
+    # row by row — this is the actual "same rows, same order" equivalence.
+    var par_ids = List[String]()
+    var par_families = List[Optional[String]]()
+    var par_deceased = List[Optional[Bool]]()
+    for bi in range(len(par_batches)):
+        var batch = par_batches[bi].copy()
+        var id_col = batch.columns[0].copy()
+        var family_col = batch.columns[3].copy()
+        var deceased_col = batch.columns[5].copy()
+        for r in range(Int(batch.length)):
+            par_ids.append(_get_utf8(id_col, r))
+            if _is_valid(family_col, r):
+                par_families.append(Optional[String](_get_utf8(family_col, r)))
+            else:
+                par_families.append(Optional[String](None))
+            if _is_valid(deceased_col, r):
+                par_deceased.append(Optional[Bool](_get_bool(deceased_col, r)))
+            else:
+                par_deceased.append(Optional[Bool](None))
+
+    assert_eq_int(len(par_ids), Int(seq_batches[0].length), "same total row count")
+    for r in range(len(par_ids)):
+        assert_eq_str(par_ids[r], _get_utf8(seq_id_col, r), "row " + String(r) + " id matches")
+        var seq_family_valid = _is_valid(seq_family_col, r)
+        assert_true(
+            seq_family_valid == Bool(par_families[r]),
+            "row " + String(r) + " family_name validity matches",
+        )
+        if seq_family_valid:
+            assert_eq_str(
+                par_families[r].value(),
+                _get_utf8(seq_family_col, r),
+                "row " + String(r) + " family_name value matches",
+            )
+        var seq_deceased_valid = _is_valid(seq_deceased_col, r)
+        assert_true(
+            seq_deceased_valid == Bool(par_deceased[r]),
+            "row " + String(r) + " deceased validity matches",
+        )
+        if seq_deceased_valid:
+            assert_true(
+                par_deceased[r].value() == _get_bool(seq_deceased_col, r),
+                "row " + String(r) + " deceased value matches",
+            )
+
+
 def main() raises:
     test_string_column_roundtrip_with_null()
     print("PASS test_string_column_roundtrip_with_null")
@@ -222,5 +363,14 @@ def main() raises:
 
     test_ndjson_to_feather_condition_end_to_end()
     print("PASS test_ndjson_to_feather_condition_end_to_end")
+
+    test_ndjson_range_to_feather_produces_subset()
+    print("PASS test_ndjson_range_to_feather_produces_subset")
+
+    test_merge_feathers_combines_in_order()
+    print("PASS test_merge_feathers_combines_in_order")
+
+    test_parallel_chunked_equivalent_to_sequential()
+    print("PASS test_parallel_chunked_equivalent_to_sequential")
 
     print("\nAll fhir_arrow builder tests passed.")
