@@ -1,9 +1,9 @@
-# resources.mojo — FHIR resource shredders.
+# resources.mojo: FHIR resource shredders.
 #
 # Each shred_<resource>(obj: JsonValue) -> <Resource>Row flattens a subset of
 # a FHIR resource's fields (the v0 scope documented in the README) into a
 # plain row struct. Fields outside that scope are simply left null, not an
-# error — only a missing `id` raises.
+# error: only a missing `id` raises.
 
 from json import JsonValue
 

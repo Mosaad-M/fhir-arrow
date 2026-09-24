@@ -1,9 +1,9 @@
-# fhir_arrow.mojo — column builders + Feather writers for shredded FHIR rows.
+# fhir_arrow.mojo: column builders + Feather writers for shredded FHIR rows.
 #
 # Uses arrow.mojo's legacy ArrowType/ArrowField/ArrowSchema/ArrowArray/
-# RecordBatch/encode_arrow_file API (proven end-to-end by csv_arrow.mojo) —
-# the newer Phase 1/2 typed-builder API (dtypes/arrays/builders.mojo) has no
-# bridge to file encoding yet.
+# RecordBatch/encode_arrow_file API (proven end-to-end by csv_arrow.mojo),
+# not the newer Phase 1/2 typed-builder API (dtypes/arrays/builders.mojo),
+# which has no bridge to file encoding yet.
 
 from std.pathlib import Path
 from arrow import (
@@ -19,7 +19,7 @@ from resources import (
 )
 
 
-# ── Bit packing (shared by validity bitmaps and Bool value buffers — both are
+# ── Bit packing (shared by validity bitmaps and Bool value buffers: both are
 #    packed 1 bit/element, LSB-first, per Arrow's format) ────────────────────
 
 

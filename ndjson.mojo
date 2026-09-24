@@ -1,4 +1,4 @@
-# ndjson.mojo — newline-delimited JSON reader.
+# ndjson.mojo: newline-delimited JSON reader.
 #
 # read_ndjson(path) -> List[JsonValue], one parsed value per non-blank line.
 # Used to read Bulk FHIR $export NDJSON files (one resource per line).
