@@ -42,10 +42,13 @@ import pyarrow.feather as f
 print(f.read_table("patients.feather"))
 ```
 
-> See **Known limitations** below: this currently fails against real
-> `pyarrow` due to a confirmed bug in the upstream `arrow` package, not in
-> this repo. Reading the file back with this repo's own `decode_arrow_file`
-> works correctly.
+Real `pyarrow` interop is verified: the upstream `arrow >=1.1.1`
+dependency fixes the Feather-format bugs that previously blocked this
+(magic bytes, Footer verification, RecordBatch body length — all fixed
+upstream, not in this repo). Confirmed directly against real Synthea
+data: `ndjson_to_feather` on all 577 Patient records, then read back with
+`pyarrow.feather.read_table()` — correct schema, correct values, all 577
+rows.
 
 ## Architecture
 
@@ -488,21 +491,17 @@ primitives are shared, not as a replacement headline.
 
 ## Known limitations
 
-- **Real `pyarrow`/DuckDB/Polars cannot currently open the `.feather` files
-  this produces. This is a confirmed bug in the upstream `arrow` package,
-  not in this repo.** `arrow.mojo`'s `encode_arrow_file` writes an 8-byte
-  trailing magic (`"ARROW1\0\0"`) at the end of the file; the real Arrow IPC
-  File Format spec requires exactly 6 bytes (`"ARROW1"`, unpadded) as the
-  very last bytes of the file, immediately after the 4-byte footer-length
-  field. `decode_arrow_file` checks the same (wrong) 8-byte trailer, so
-  round-tripping through this library's own reader works and every test in
-  this repo passes, but a spec-correct reader rejects the file with
-  `ArrowInvalid: Not an Arrow file`. Confirmed this isn't specific to this
-  repo's code: `arrow`'s own `csv_arrow.mojo` quick-start example produces
-  the identical broken trailer. Fix belongs upstream, in `arrow.mojo`'s
-  `_arrow_magic()`/`encode_arrow_file`/`decode_arrow_file` (around
-  arrow.mojo:1031, 1107-1233): the trailer write/check needs to use 6 bytes,
-  not the shared 8-byte header magic.
+- **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
+  produces** — verified directly against real Synthea Patient data (577
+  rows, correct schema and values read back via `pyarrow.feather.
+  read_table()`), not just this repo's own `decode_arrow_file`. This
+  required three separate bug fixes upstream, in `arrow` (`>=1.1.1`) and
+  its `flatbuffers` dependency (`>=1.1.1`): the trailing magic bytes
+  (8 bytes written, spec requires 6), an inverted `soffset` sign
+  convention in the FlatBuffers Footer encoding, and RecordBatch
+  `Block.bodyLength` being computed from the wrong reference point. None
+  of that code lived in this repo; bump the `arrow` dependency to pick up
+  the fix.
 - Only the fields listed above are shredded; everything else in a resource
   is dropped, not preserved in an "extra fields" column.
 - `id` is the only field treated as required; every other field's absence

@@ -3,24 +3,17 @@
   "packages": [
     {
       "name": "arrow",
-      "version": "1.1.0",
-      "source_url": "https://github.com/Mosaad-M/arrow/archive/refs/tags/v1.1.0.tar.gz",
-      "sha256": "74bd990afd4a098780a73bbd1482c8b00eace901cc71ac4e4c7fe54b459361f4",
-      "install_path": "/Users/myronmosaad/.mojo/packages/arrow/1.1.0"
-    },
-    {
-      "name": "json",
-      "version": "1.1.0",
-      "source_url": "https://github.com/Mosaad-M/json/archive/refs/tags/v1.1.0.tar.gz",
-      "sha256": "20cb7028bf634fffd09ad0e8986c5a8d700845f7ea7703028e5a66cd9329d142",
-      "install_path": "/Users/myronmosaad/.mojo/packages/json/1.1.0"
+      "version": "1.1.1",
+      "source_url": "https://github.com/Mosaad-M/arrow/archive/refs/tags/v1.1.1.tar.gz",
+      "sha256": "cb8eac9da56cd4ca01d14a54ed3b5bb62c187541edbd36a57ed914dcb5eb0720",
+      "install_path": "/Users/myronmosaad/.mojo/packages/arrow/1.1.1"
     },
     {
       "name": "flatbuffers",
-      "version": "1.1.0",
-      "source_url": "https://github.com/Mosaad-M/flatbuffers/archive/refs/tags/v1.1.0.tar.gz",
-      "sha256": "56ef9389369ad9f5724406a136979eda9742328c7f67c5635e3bad8a23c57f84",
-      "install_path": "/Users/myronmosaad/.mojo/packages/flatbuffers/1.1.0"
+      "version": "1.1.1",
+      "source_url": "https://github.com/Mosaad-M/flatbuffers/archive/refs/tags/v1.1.1.tar.gz",
+      "sha256": "537372df13c53825c3caa5613f9de79c86c9f12ba0e77e80823a1b4db7d28f82",
+      "install_path": "/Users/myronmosaad/.mojo/packages/flatbuffers/1.1.1"
     }
   ]
 }
