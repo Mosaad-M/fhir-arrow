@@ -1,0 +1,13 @@
+[package]
+name = "fhir-arrow"
+version = "0.1.0"
+description = "Bulk FHIR NDJSON shredder producing Apache Arrow Feather files, in pure Mojo"
+license = "MIT"
+platforms = ["linux-64", "osx-arm64"]
+
+[mojo]
+requires = ">=1.0.0"
+
+[dependencies]
+arrow = { git = "Mosaad-M/arrow", version = ">=1.1.0" }
+json = { git = "Mosaad-M/json", version = ">=1.1.0" }
