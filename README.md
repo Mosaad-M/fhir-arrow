@@ -116,6 +116,53 @@ arrays, which is the part worth showing off.
 | `onset_datetime` | `onsetDateTime` | other `onset[x]` variants (e.g. `onsetAge`) are **out of scope**, left null |
 | `recorded_date` | `recordedDate` | |
 
+## Benchmark
+
+Measured on a 577-patient Synthea-generated Bulk FHIR export (Massachusetts,
+population `500` passed to Synthea, which yields ~577 patients since some
+are filtered by age constraints): 266,750 Observation records, 19,025
+Condition records, 577 Patient records. Generate the same dataset with
+`bench/gen_synthea_data.sh 500 Massachusetts`.
+
+```bash
+pixi run mojo run $(cat .mojo_flags) bench_fhir_arrow.mojo <synthea_fhir_dir> <out_dir>
+python3 bench/bench_python.py <synthea_fhir_dir> <out_dir>
+```
+
+| Resource | Mojo (this repo) | Python (json + pandas/pyarrow) |
+|---|---|---|
+| Patient (577 rows) | 28.7 ms, 20,088 rows/sec | 34.3 ms, 16,841 rows/sec |
+| Observation (266,750 rows) | 5,434.0 ms, 49,089 rows/sec | 2,519.0 ms, 105,896 rows/sec |
+| Condition (19,025 rows) | 390.3 ms, 48,751 rows/sec | 154.8 ms, 122,905 rows/sec |
+
+**Honest result: as of this v0, the Python baseline is faster, roughly 2 to
+2.5x on Observation and Condition.** This contradicts what was originally
+expected going in; reporting the real measured numbers rather than the
+hoped-for ones. The gap traces to two concrete, fixable causes, not to a
+ceiling on what Mojo can do here:
+
+1. **JSON parsing dominates the cost, and `json.mojo` is a general-purpose
+   recursive-descent parser that heap-allocates a full `JsonValue` tree per
+   record** (one `alloc()` per nested array/object, walked through
+   `Optional[Pointer[...]]` indirection). CPython's `json` module is a
+   mature, heavily optimized C extension; a heap-allocating tree-walking
+   parser in Mojo has no structural advantage over it and pays real
+   allocation overhead this workload doesn't need, since only a handful of
+   known fields are ever read out of each parsed tree.
+2. **The column builders in `fhir_arrow.mojo` grow buffers one byte/bit at a
+   time via `List.append`** (see `build_string_column`, `_pack_bits`), with
+   no capacity pre-reservation, versus pandas/pyarrow's vectorized C++
+   internals.
+
+The fix for (1) is exactly the SIMD/zero-copy "narrow shredder" approach
+this project was originally motivated by: scan each NDJSON line's bytes
+directly for the handful of known field paths this repo actually extracts,
+instead of materializing a full generic JSON tree first. That's future work,
+not implemented in this v0: the honest scope of this repo right now is a
+**correct, TDD-verified, real-Feather-writing pipeline**, not yet a fast
+one. Fixing (2) (pre-sized buffers, direct byte writes instead of
+`List.append`) is a smaller, more mechanical follow-up.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars cannot currently open the `.feather` files
