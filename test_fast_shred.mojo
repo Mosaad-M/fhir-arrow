@@ -7,6 +7,7 @@
 
 from fast_shred import (
     _skip_value, _find_key, _find_keys, _first_array_element, _extract_string,
+    _simd_find2, _simd_find3, _SIMD_WIDTH,
     shred_patient_fast, shred_observation_fast, shred_condition_fast,
 )
 
@@ -36,6 +37,92 @@ def assert_near(a: Float64, b: Float64, msg: String) raises:
         raise Error(
             "FAIL: " + msg + ", got " + String(a) + ", expected " + String(b)
         )
+
+
+# ── _simd_find2 / _simd_find3 ────────────────────────────────────────────────
+# Boundary-focused: this is where a chunked SIMD search could actually have
+# bugs even under the "safe" design (only accelerating candidate-finding,
+# never changing decision logic) — off-by-one at chunk edges, not
+# escape/depth logic, which is unchanged and already covered below.
+
+
+def _padded(prefix_len: Int, target: String, suffix_len: Int) -> String:
+    """Build "a"*prefix_len + target + "a"*suffix_len, for placing a target
+    byte at an exact offset relative to a scan start."""
+    var s = String()
+    for _ in range(prefix_len):
+        s += "a"
+    s += target
+    for _ in range(suffix_len):
+        s += "a"
+    return s
+
+
+def test_simd_find2_candidate_at_width_minus_1() raises:
+    var s = _padded(_SIMD_WIDTH - 1, "X", 10)
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, _SIMD_WIDTH - 1, "candidate at W-1 should be found inside the first chunk")
+
+
+def test_simd_find2_candidate_at_width() raises:
+    var s = _padded(_SIMD_WIDTH, "X", 10)
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, _SIMD_WIDTH, "candidate at exactly W should be found (start of second chunk)")
+
+
+def test_simd_find2_candidate_at_width_plus_1() raises:
+    var s = _padded(_SIMD_WIDTH + 1, "X", 10)
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, _SIMD_WIDTH + 1, "candidate at W+1 should be found just inside the second chunk")
+
+
+def test_simd_find2_span_shorter_than_width() raises:
+    # Total length well under _SIMD_WIDTH: forces the pure scalar-tail path,
+    # the chunked loop body must never execute.
+    var s = String("aaXaaa")
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, 2, "short span should still be scanned correctly via the scalar tail")
+
+
+def test_simd_find2_span_not_multiple_of_width() raises:
+    # _SIMD_WIDTH + 13 total bytes: one full chunk, then a 13-byte tail.
+    # Put the candidate in the tail to exercise the boundary between them.
+    var s = _padded(_SIMD_WIDTH + 5, "X", 7)
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, _SIMD_WIDTH + 5, "candidate in the non-chunk-aligned tail should be found")
+
+
+def test_simd_find2_multiple_candidates_returns_first() raises:
+    var s = String("aaaaaXaaaaaaaaaYaaaaaaaaaaaaaaaa")  # X at 5, Y at 15
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, 5, "should return the first candidate, not just any match in the chunk")
+
+
+def test_simd_find2_backslash_as_last_byte() raises:
+    var s = String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\")  # 32 a's + trailing backslash
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord('"')), UInt8(ord("\\")))
+    assert_eq_int(pos, 32, "a backslash as the literal last byte before the boundary must still be found")
+
+
+def test_simd_find2_not_found_returns_length() raises:
+    var s = _padded(_SIMD_WIDTH + 10, "", 0)  # no X/Y anywhere
+    var b = s.as_bytes()
+    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, len(b), "no match should return len(b), the same sentinel the scalar loop relied on")
+
+
+def test_simd_find3_finds_third_target() raises:
+    var s = _padded(_SIMD_WIDTH + 2, "Z", 5)
+    var b = s.as_bytes()
+    var pos = _simd_find3(b, 0, UInt8(ord("X")), UInt8(ord("Y")), UInt8(ord("Z")))
+    assert_eq_int(pos, _SIMD_WIDTH + 2, "third target byte should be found across the chunk boundary")
 
 
 # ── _skip_value ────────────────────────────────────────────────────────────
@@ -540,6 +627,25 @@ def test_shred_condition_fast_unicode_escape_in_skipped_field() raises:
 
 
 def main() raises:
+    test_simd_find2_candidate_at_width_minus_1()
+    print("PASS test_simd_find2_candidate_at_width_minus_1")
+    test_simd_find2_candidate_at_width()
+    print("PASS test_simd_find2_candidate_at_width")
+    test_simd_find2_candidate_at_width_plus_1()
+    print("PASS test_simd_find2_candidate_at_width_plus_1")
+    test_simd_find2_span_shorter_than_width()
+    print("PASS test_simd_find2_span_shorter_than_width")
+    test_simd_find2_span_not_multiple_of_width()
+    print("PASS test_simd_find2_span_not_multiple_of_width")
+    test_simd_find2_multiple_candidates_returns_first()
+    print("PASS test_simd_find2_multiple_candidates_returns_first")
+    test_simd_find2_backslash_as_last_byte()
+    print("PASS test_simd_find2_backslash_as_last_byte")
+    test_simd_find2_not_found_returns_length()
+    print("PASS test_simd_find2_not_found_returns_length")
+    test_simd_find3_finds_third_target()
+    print("PASS test_simd_find3_finds_third_target")
+
     test_skip_value_simple_string()
     print("PASS test_skip_value_simple_string")
     test_skip_value_string_with_escaped_quote()

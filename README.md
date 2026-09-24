@@ -241,7 +241,7 @@ comfortable win is Patient's, where per-record fixed overhead (six-plus
 independent re-scans down to one) dominated more heavily relative to total
 work per record.
 
-### Phase A: zero-copy line reading (current)
+### Phase A: zero-copy line reading
 
 `read_ndjson_lines` used to split the whole file into one owned `String`
 per line (`content.split("\n")` plus an explicit copy of each survivor) —
@@ -409,6 +409,82 @@ An explicit equivalence test (`test_parallel_chunked_equivalent_to_sequential`
 in `test_fhir_arrow.mojo`) proves chunk+merge produces identical row
 values, in identical order, to the plain sequential path on the same
 input, before any of these numbers were trusted.
+
+### Phase E: SIMD-accelerated structural scanning (current)
+
+`_skip_string` and `_skip_value`'s object/array depth-counting loop used to
+advance one byte at a time while nothing structurally interesting was
+happening. Both now use a SIMD-accelerated search (`_simd_find2`/
+`_simd_find3` in `fast_shred.mojo`) to jump straight to the next candidate
+byte (`"`/`\` for strings; `"`/open-bracket/close-bracket for the
+object/array depth loop) instead of checking one byte at a time — the
+scalar logic that decides what a candidate byte *means* (escape handling,
+depth increment/decrement) is completely unchanged. This is a deliberately
+narrower design than full simdjson-style bulk structural classification
+(which computes escape/quote parity across a whole buffer and can break at
+chunk boundaries): here, chunking only changes *how fast* a candidate is
+located, never what happens once it's found, so there's no
+boundary-crossing correctness class of bug to worry about the way real
+simdjson has to guard against.
+
+The technique mirrors `1brc_arrow.mojo`'s `find_byte_simd_reduce` (XOR two
+SIMD vectors, `reduce_min() == 0` iff any lane matched), extended from one
+target byte to two/three via elementwise `min()` of the XOR vectors — a
+lane is exactly 0 iff it matched *any* target. `SIMD_WIDTH = 32` (AVX2)
+reuses `1brc_arrow`'s already-CI-validated choice for this repo's declared
+`linux-64`/`osx-arm64` platforms. One thing confirmed empirically rather
+than assumed: SIMD `==` between two full vectors collapses to a single
+reduced `Bool` on this toolchain rather than an elementwise mask — which is
+exactly why `1brc_arrow` uses XOR+`reduce_min` instead of `==`, and why
+this code does too.
+
+9 new tests cover the boundary cases this kind of chunked search can
+actually get wrong (unlike the escape/depth logic itself, which is
+untouched): a candidate at exactly `SIMD_WIDTH - 1`/`SIMD_WIDTH`/
+`SIMD_WIDTH + 1` bytes from the scan start, a span shorter than
+`SIMD_WIDTH` (pure scalar-tail path), a span not a multiple of
+`SIMD_WIDTH`, multiple candidates in one chunk (must return the first),
+and a backslash as the literal last byte before the boundary. One bug
+surfaced immediately, in the test itself, not the implementation: the
+first version of the backslash-at-boundary test asserted the wrong index
+(off-by-one — 32 `a`s followed by one backslash puts the backslash at
+index 32, not 33); caught by running it, fixed in the test, not silenced.
+All 66 pre-existing tests (13 ndjson + 45 fast_shred + 8 fhir_arrow) still
+pass unchanged, proving behavioral equivalence with the byte-by-byte
+version it replaced.
+
+Same dataset, same machine, sequential path (the recommended default):
+
+| Resource | Mojo (A+B+C) | Mojo (Phase E) | Python | E vs A+B+C | E vs Python |
+|---|---|---|---|---|---|
+| Patient (577 rows) | 5.5 ms | 5.13 ms | 22.8 ms | 6.7% faster | **Mojo 4.44x faster** |
+| Observation (266,750 rows) | 2,131.9 ms | 2,063 ms | 2,472 ms | 3.2% faster | **Mojo 1.20x faster** |
+| Condition (19,025 rows) | 140.8 ms | 130 ms | 153.3 ms | 7.7% faster | **Mojo 1.18x faster** |
+
+Real but modest gains, smaller than A+B+C's combined effect. The reason is
+structural: `_extract_string`'s Phase B fast path already handles the
+common case (a short field value) in effectively one pass regardless of
+SIMD, and most FHIR field values here (ids, codes, dates) are well under
+32 bytes — short enough that the chunked loop never executes at all, only
+the scalar tail does, identical cost to before. SIMD's actual win is
+concentrated in *skipping large substructures entirely* (an `extension`
+array, a big `category`/`meta` object) via `_skip_value`, which happens
+less often per record than short-field extraction does. Reporting the real
+number rather than the hoped-for one, same standard as every phase above.
+
+The parallel path shares these same primitives, so it improved too (same
+Synthea data, 8 workers both sides):
+
+| Resource | Parallel Mojo (Phase D) | Parallel Mojo (Phase E) | Parallel Python | E vs Python |
+|---|---|---|---|---|
+| Patient (577 rows) | 99.4 ms | 60 ms | 640.6 ms | **Mojo 10.68x faster** |
+| Observation (266,750 rows) | 1,685.0 ms | 1,610 ms | 1,735.0 ms | **Mojo 1.08x faster** |
+| Condition (19,025 rows) | 202.3 ms | 160 ms | 687.4 ms | **Mojo 4.30x faster** |
+
+The sequential-vs-Python comparison above remains the headline metric per
+the project's own phase-D finding that sequential is the safer default;
+the parallel numbers are reported for completeness since the same
+primitives are shared, not as a replacement headline.
 
 ## Known limitations
 

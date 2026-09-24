@@ -47,13 +47,98 @@ def _is_ws(c: UInt8) -> Bool:
     return c == _SPACE or c == _TAB or c == _CR or c == _LF
 
 
+# ── SIMD-accelerated candidate search ────────────────────────────────────────
+#
+# _skip_string and _skip_value both used to advance one byte at a time while
+# nothing structurally interesting was happening ("else: i += 1"). These two
+# helpers replace ONLY that "boring byte, keep going" branch with a bulk
+# vectorized search for the next byte that actually matters; the scalar logic
+# that decides what a candidate byte MEANS (escape handling in _skip_string,
+# depth counting in _skip_value) is untouched below. That's a deliberate,
+# narrower design than full simdjson-style bulk structural classification
+# (which computes escape/quote parity across a whole buffer and can break at
+# chunk boundaries) — here, chunking only changes how fast a candidate is
+# found, never what happens once it's found, so there's no boundary-crossing
+# correctness class of bug to worry about the way real simdjson has to.
+#
+# Technique mirrors 1brc_arrow.mojo's find_byte_simd_reduce (XOR + reduce),
+# extended from one target byte to two/three via elementwise min() of the
+# XOR vectors: a lane is exactly 0 iff it matched ANY of the targets, so
+# min(chunk^v0, chunk^v1, ...) is 0 in some lane iff the chunk contains a
+# hit for any target. Confirmed empirically against this toolchain (not
+# assumed) that SIMD `==` on a full vector collapses to a single reduced
+# Bool here rather than an elementwise mask, which is exactly why
+# 1brc_arrow uses XOR+reduce_min instead of `==` — same reason applies here.
+#
+# SIMD_WIDTH = 32 (AVX2, 256-bit / 8-bit lanes) matches 1brc_arrow's choice,
+# already validated safe for this repo's declared linux-64/osx-arm64
+# platforms (GitHub's ubuntu-22.04 runners have AVX2 but not AVX-512).
+
+comptime _SIMD_WIDTH = 32
+
+
+def _simd_find2(b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8) raises -> Int:
+    """First occurrence of t0 or t1 in b[start:], scanning in
+    _SIMD_WIDTH-byte chunks with a scalar tail for the remainder. Returns
+    len(b) if neither occurs (same sentinel the scalar loops it replaces
+    already relied on: their `while i < n` bound)."""
+    var n = len(b)
+    var ptr = b.unsafe_ptr()
+    var v0 = SIMD[DType.uint8, _SIMD_WIDTH](t0)
+    var v1 = SIMD[DType.uint8, _SIMD_WIDTH](t1)
+    var pos = start
+    while pos + _SIMD_WIDTH <= n:
+        var chunk = ptr.unsafe_offset(pos).unsafe_load[width=_SIMD_WIDTH]()
+        var m = min(chunk ^ v0, chunk ^ v1)
+        if m.reduce_min() == UInt8(0):
+            for j in range(_SIMD_WIDTH):
+                if chunk[j] == t0 or chunk[j] == t1:
+                    return pos + j
+        pos += _SIMD_WIDTH
+    while pos < n:
+        var c = b[pos]
+        if c == t0 or c == t1:
+            return pos
+        pos += 1
+    return n
+
+
+def _simd_find3(
+    b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8, t2: UInt8
+) raises -> Int:
+    """Same as _simd_find2 but for three target bytes."""
+    var n = len(b)
+    var ptr = b.unsafe_ptr()
+    var v0 = SIMD[DType.uint8, _SIMD_WIDTH](t0)
+    var v1 = SIMD[DType.uint8, _SIMD_WIDTH](t1)
+    var v2 = SIMD[DType.uint8, _SIMD_WIDTH](t2)
+    var pos = start
+    while pos + _SIMD_WIDTH <= n:
+        var chunk = ptr.unsafe_offset(pos).unsafe_load[width=_SIMD_WIDTH]()
+        var m = min(min(chunk ^ v0, chunk ^ v1), chunk ^ v2)
+        if m.reduce_min() == UInt8(0):
+            for j in range(_SIMD_WIDTH):
+                if chunk[j] == t0 or chunk[j] == t1 or chunk[j] == t2:
+                    return pos + j
+        pos += _SIMD_WIDTH
+    while pos < n:
+        var c = b[pos]
+        if c == t0 or c == t1 or c == t2:
+            return pos
+        pos += 1
+    return n
+
+
 # ── _skip_string: i must point exactly at the opening quote ─────────────────
 
 
 def _skip_string(b: Span[UInt8, _], start: Int) raises -> Int:
-    var i = start + 1  # skip opening quote
     var n = len(b)
+    var i = start + 1  # skip opening quote
     while i < n:
+        i = _simd_find2(b, i, _QUOTE, _BACKSLASH)
+        if i >= n:
+            break
         var c = b[i]
         if c == _BACKSLASH:
             i += 1
@@ -63,10 +148,8 @@ def _skip_string(b: Span[UInt8, _], start: Int) raises -> Int:
                 i += 5  # 'u' + 4 hex digits
             else:
                 i += 1
-        elif c == _QUOTE:
+        else:  # c == _QUOTE
             return i + 1
-        else:
-            i += 1
     raise Error("fast_shred: _skip_string: unterminated string starting at " + String(start))
 
 
@@ -93,16 +176,17 @@ def _skip_value(b: Span[UInt8, _], start: Int) raises -> Int:
         var depth = 1
         i += 1
         while i < n and depth > 0:
+            i = _simd_find3(b, i, _QUOTE, open_, close)
+            if i >= n:
+                break
             var d = b[i]
             if d == _QUOTE:
                 i = _skip_string(b, i)
             elif d == open_:
                 depth += 1
                 i += 1
-            elif d == close:
+            else:  # d == close
                 depth -= 1
-                i += 1
-            else:
                 i += 1
         if depth != 0:
             raise Error("fast_shred: _skip_value: unterminated object/array")
