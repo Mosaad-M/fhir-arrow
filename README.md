@@ -489,6 +489,53 @@ the project's own phase-D finding that sequential is the safer default;
 the parallel numbers are reported for completeness since the same
 primitives are shared, not as a replacement headline.
 
+### Phase F: batch multi-hit SIMD scanning — tried, measured, reverted
+
+Bumping the `arrow` dependency to `1.1.2` (a `List.extend()` fix in
+`arrow` itself, unrelated to this repo — see its own changelog) moved the
+baseline to Patient 4.888 ms / Observation 1863.4 ms / Condition 119.9 ms
+on the same data, purely from faster Feather encoding. Real record
+analysis of that baseline (765-byte Observation records: ~39% of bytes
+are fields this v0 schema skips entirely — `resourceType`/`meta`/
+`category`/`encounter`) motivated a real attempt to close the shredding
+gap further: instead of Phase E's "find the *first* candidate per chunk,
+early-exit," batch-extract *every* hit position from one loaded chunk
+(using `SIMD.eq()` as an explicit method — confirmed to return a real
+elementwise `SIMD[DType.bool, W]`, unlike the `==` *operator*, which
+collapses to a scalar `Bool` — combined with `|` across targets), so the
+SIMD setup cost is amortized across every hit in a dense window instead
+of paid once per hit.
+
+**Measured directly, not assumed, and it was a real regression, not just
+underwhelming**: the first version (returning a fresh heap-allocated
+`List[Int]` per chunk load) measured 3-13x *slower*. Switching to a
+stack-allocated fixed buffer (`SIMD[DType.int64, 32]`, reused per call,
+no heap allocation) recovered most of that but was still 1.5-9x slower
+than the Phase E baseline. Root cause, found by tracing through both
+designs rather than guessing: extracting *every* hit from a chunk
+requires an unconditional full 32-lane scan (`for j in range(32): if
+mask[j]: ...`), while Phase E's early-exit design (`return pos + j` the
+moment a match is found) does far less work for the common case — and
+for real FHIR JSON, that common case (a string's own closing quote, a
+single structural delimiter) *is* almost always exactly one hit per
+call. Batching only pays off when a chunk holds several hits worth
+amortizing the scan over, and for this workload's actual density profile
+that's the exception, not the rule — confirming and sharpening Phase E's
+own finding, not contradicting it.
+
+Reverted `_skip_string` fully back to the early-exit design
+(`_simd_find_first2`); `_skip_value`'s bracket-depth loop the same
+(`_simd_find_first3`) after it showed the identical pattern. Net result:
+functionally the same algorithm Phase E already had, re-verified against
+the same benchmark — Patient 4.833 ms, Observation 1670.8 ms (10.3%
+faster than the post-bump baseline), Condition 111.8 ms (6.7% faster) —
+essentially a wash on top of the `arrow` version bump, not a new win from
+this attempt itself, and reported as such rather than credited to
+something that didn't pan out. All 61 `fast_shred.mojo` tests pass
+(several new ones added for the escaped-quote-adjacency edge cases this
+investigation surfaced), full suite and real `pyarrow` interop
+re-verified unchanged.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
@@ -523,7 +570,7 @@ primitives are shared, not as a replacement headline.
 
 ## Dependencies
 
-- [arrow](https://github.com/Mosaad-M/arrow) `>=1.1.0`: pure-Mojo Arrow IPC
+- [arrow](https://github.com/Mosaad-M/arrow) `>=1.1.2`: pure-Mojo Arrow IPC
   encoder/decoder (pulls in `flatbuffers` transitively)
 
 No `max` dependency: Phase D's parallel path investigated

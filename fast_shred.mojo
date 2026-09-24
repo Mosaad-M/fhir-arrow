@@ -51,24 +51,23 @@ def _is_ws(c: UInt8) -> Bool:
 #
 # _skip_string and _skip_value both used to advance one byte at a time while
 # nothing structurally interesting was happening ("else: i += 1"). These two
-# helpers replace ONLY that "boring byte, keep going" branch with a bulk
-# vectorized search for the next byte that actually matters; the scalar logic
-# that decides what a candidate byte MEANS (escape handling in _skip_string,
-# depth counting in _skip_value) is untouched below. That's a deliberate,
-# narrower design than full simdjson-style bulk structural classification
-# (which computes escape/quote parity across a whole buffer and can break at
-# chunk boundaries) — here, chunking only changes how fast a candidate is
-# found, never what happens once it's found, so there's no boundary-crossing
-# correctness class of bug to worry about the way real simdjson has to.
+# helpers replace that "boring byte, keep going" branch with a bulk
+# vectorized search for the FIRST matching candidate; the scalar logic that
+# decides what a candidate byte MEANS (escape handling in _skip_string, depth
+# counting in _skip_value) is untouched below.
 #
-# Technique mirrors 1brc_arrow.mojo's find_byte_simd_reduce (XOR + reduce),
-# extended from one target byte to two/three via elementwise min() of the
-# XOR vectors: a lane is exactly 0 iff it matched ANY of the targets, so
-# min(chunk^v0, chunk^v1, ...) is 0 in some lane iff the chunk contains a
-# hit for any target. Confirmed empirically against this toolchain (not
-# assumed) that SIMD `==` on a full vector collapses to a single reduced
-# Bool here rather than an elementwise mask, which is exactly why
-# 1brc_arrow uses XOR+reduce_min instead of `==` — same reason applies here.
+# A batch-extraction variant of this (find ALL hits in one chunk load, not
+# just the first, using SIMD.eq()+`|` for a real elementwise mask) was tried
+# and measured directly against this repo's own benchmark — see
+# tasks/lessons.md for the full writeup. It was a real regression, not just
+# underwhelming: 1.5-9x SLOWER end to end, because the mandatory full-32-lane
+# extraction scan it needs (to find every hit, not just the first) costs more
+# than an early-exit single-hit scan for the common case, which for real FHIR
+# JSON is a single hit per call (a string's own closing quote, a field's
+# structural delimiter) — batching only pays off when a chunk holds several
+# hits worth amortizing the scan over, and that's the exception here, not the
+# rule. Reverted back to this single-hit early-exit design after confirming
+# that with the same real Synthea data and the same benchmark.
 #
 # SIMD_WIDTH = 32 (AVX2, 256-bit / 8-bit lanes) matches 1brc_arrow's choice,
 # already validated safe for this repo's declared linux-64/osx-arm64
@@ -77,11 +76,20 @@ def _is_ws(c: UInt8) -> Bool:
 comptime _SIMD_WIDTH = 32
 
 
-def _simd_find2(b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8) raises -> Int:
-    """First occurrence of t0 or t1 in b[start:], scanning in
-    _SIMD_WIDTH-byte chunks with a scalar tail for the remainder. Returns
-    len(b) if neither occurs (same sentinel the scalar loops it replaces
-    already relied on: their `while i < n` bound)."""
+def _simd_find_first2(b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8) raises -> Int:
+    """First occurrence of t0 or t1 in b[start:], early-exiting as soon as
+    a match is found within a chunk (does NOT batch-extract every hit).
+    Used by _skip_string specifically: a string almost always has exactly
+    one relevant hit per call (its own closing quote, no escapes) — for
+    that common case, an unconditional full-chunk lane scan (as
+    _load_chunk_hits2 does, needed to find EVERY hit) costs strictly more
+    than finding just the first and stopping, since it always walks all
+    _SIMD_WIDTH lanes regardless of how early the match is. Measured
+    directly: using the batch extractor here made the whole pipeline
+    3-8x SLOWER, not faster — see lessons.md. _skip_value keeps the batch
+    extractor (_load_chunk_hits3) since its own multi-hit chunks (quote/
+    open/close close together while scanning past a skipped object) are
+    common enough there to be worth it; _skip_string's are not."""
     var n = len(b)
     var ptr = b.unsafe_ptr()
     var v0 = SIMD[DType.uint8, _SIMD_WIDTH](t0)
@@ -103,10 +111,11 @@ def _simd_find2(b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8) raises -> I
     return n
 
 
-def _simd_find3(
+def _simd_find_first3(
     b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8, t2: UInt8
 ) raises -> Int:
-    """Same as _simd_find2 but for three target bytes."""
+    """Same as _simd_find_first2 but for three target bytes (used by
+    _skip_value's bracket-depth loop: quote/open/close)."""
     var n = len(b)
     var ptr = b.unsafe_ptr()
     var v0 = SIMD[DType.uint8, _SIMD_WIDTH](t0)
@@ -136,7 +145,7 @@ def _skip_string(b: Span[UInt8, _], start: Int) raises -> Int:
     var n = len(b)
     var i = start + 1  # skip opening quote
     while i < n:
-        i = _simd_find2(b, i, _QUOTE, _BACKSLASH)
+        i = _simd_find_first2(b, i, _QUOTE, _BACKSLASH)
         if i >= n:
             break
         var c = b[i]
@@ -176,7 +185,7 @@ def _skip_value(b: Span[UInt8, _], start: Int) raises -> Int:
         var depth = 1
         i += 1
         while i < n and depth > 0:
-            i = _simd_find3(b, i, _QUOTE, open_, close)
+            i = _simd_find_first3(b, i, _QUOTE, open_, close)
             if i >= n:
                 break
             var d = b[i]

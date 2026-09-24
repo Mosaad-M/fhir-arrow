@@ -6,8 +6,8 @@
 # Section 3: adversarial cases the tree parser never had to worry about.
 
 from fast_shred import (
-    _skip_value, _find_key, _find_keys, _first_array_element, _extract_string,
-    _simd_find2, _simd_find3, _SIMD_WIDTH,
+    _skip_value, _skip_string, _find_key, _find_keys, _first_array_element, _extract_string,
+    _simd_find_first2, _simd_find_first3, _SIMD_WIDTH,
     shred_patient_fast, shred_observation_fast, shred_condition_fast,
 )
 
@@ -39,11 +39,14 @@ def assert_near(a: Float64, b: Float64, msg: String) raises:
         )
 
 
-# ── _simd_find2 / _simd_find3 ────────────────────────────────────────────────
+# ── _simd_find_first2 / _simd_find_first3 ────────────────────────────────────
 # Boundary-focused: this is where a chunked SIMD search could actually have
 # bugs even under the "safe" design (only accelerating candidate-finding,
 # never changing decision logic) — off-by-one at chunk edges, not
-# escape/depth logic, which is unchanged and already covered below.
+# escape/depth logic, which is unchanged and already covered below. (An
+# earlier batch-extraction version of this section, and its multi-hit
+# tests, was tried and reverted after measuring a real regression — see
+# fast_shred.mojo's header comment and tasks/lessons.md.)
 
 
 def _padded(prefix_len: Int, target: String, suffix_len: Int) -> String:
@@ -58,71 +61,76 @@ def _padded(prefix_len: Int, target: String, suffix_len: Int) -> String:
     return s
 
 
-def test_simd_find2_candidate_at_width_minus_1() raises:
+def test_simd_find_first3_candidate_at_width_plus_2() raises:
+    var s = _padded(_SIMD_WIDTH + 2, "Z", 5)
+    var b = s.as_bytes()
+    var pos = _simd_find_first3(b, 0, UInt8(ord("X")), UInt8(ord("Y")), UInt8(ord("Z")))
+    assert_eq_int(pos, _SIMD_WIDTH + 2, "third target byte should be found across the chunk boundary")
+
+
+def test_simd_find_first2_candidate_at_width_minus_1() raises:
     var s = _padded(_SIMD_WIDTH - 1, "X", 10)
     var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    var pos = _simd_find_first2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
     assert_eq_int(pos, _SIMD_WIDTH - 1, "candidate at W-1 should be found inside the first chunk")
 
 
-def test_simd_find2_candidate_at_width() raises:
-    var s = _padded(_SIMD_WIDTH, "X", 10)
-    var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
-    assert_eq_int(pos, _SIMD_WIDTH, "candidate at exactly W should be found (start of second chunk)")
-
-
-def test_simd_find2_candidate_at_width_plus_1() raises:
-    var s = _padded(_SIMD_WIDTH + 1, "X", 10)
-    var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
-    assert_eq_int(pos, _SIMD_WIDTH + 1, "candidate at W+1 should be found just inside the second chunk")
-
-
-def test_simd_find2_span_shorter_than_width() raises:
-    # Total length well under _SIMD_WIDTH: forces the pure scalar-tail path,
-    # the chunked loop body must never execute.
+def test_simd_find_first2_span_shorter_than_width() raises:
     var s = String("aaXaaa")
     var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    var pos = _simd_find_first2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
     assert_eq_int(pos, 2, "short span should still be scanned correctly via the scalar tail")
 
 
-def test_simd_find2_span_not_multiple_of_width() raises:
-    # _SIMD_WIDTH + 13 total bytes: one full chunk, then a 13-byte tail.
-    # Put the candidate in the tail to exercise the boundary between them.
-    var s = _padded(_SIMD_WIDTH + 5, "X", 7)
+def test_simd_find_first2_not_found_returns_length() raises:
+    var s = _padded(_SIMD_WIDTH + 10, "", 0)
     var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
-    assert_eq_int(pos, _SIMD_WIDTH + 5, "candidate in the non-chunk-aligned tail should be found")
+    var pos = _simd_find_first2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
+    assert_eq_int(pos, len(b), "no match should return len(b)")
 
 
-def test_simd_find2_multiple_candidates_returns_first() raises:
-    var s = String("aaaaaXaaaaaaaaaYaaaaaaaaaaaaaaaa")  # X at 5, Y at 15
+# ── Escaped-quote adjacency ───────────────────────────────────────────────
+# Extra adversarial coverage for _skip_string's escape handling when
+# multiple escape sequences / quotes sit close together, the kind of dense
+# packing real FHIR "note"-style free-text fields can have.
+
+
+def test_skip_string_escaped_quote_immediately_followed_by_real_quote() raises:
+    # `\"X"` -- an escaped quote immediately followed by the real closing
+    # quote. The escaped quote must not be
+    # mistaken for the terminator.
+    var s = String('"\\"X"')  # opening quote, \", X, closing quote
     var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
-    assert_eq_int(pos, 5, "should return the first candidate, not just any match in the chunk")
+    var end = _skip_string(b, 0)
+    assert_eq_int(end, len(b), "must consume through the real closing quote, not the escaped one")
 
 
-def test_simd_find2_backslash_as_last_byte() raises:
-    var s = String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\")  # 32 a's + trailing backslash
+def test_skip_string_multiple_escaped_quotes_then_real_quote() raises:
+    var s = String('"\\"\\"\\"done"')  # three escaped quotes, then "done", then real close
     var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord('"')), UInt8(ord("\\")))
-    assert_eq_int(pos, 32, "a backslash as the literal last byte before the boundary must still be found")
+    var end = _skip_string(b, 0)
+    assert_eq_int(end, len(b), "must skip all three escaped quotes and stop at the real one")
 
 
-def test_simd_find2_not_found_returns_length() raises:
-    var s = _padded(_SIMD_WIDTH + 10, "", 0)  # no X/Y anywhere
+def test_skip_string_unicode_escape_consuming_past_a_pending_hit() raises:
+    # " is a literal backslash-u-0022 sequence (not an actual quote
+    # byte) -- the extractor still only sees a backslash as the hit; the
+    # hex digits that follow are never targets, so this mainly proves the
+    # +5 consumption doesn't desync the cursor from subsequent real hits.
+    var s = String('"a\\u0022b\\"c"')  # a, " (escape), b, \" (escape), c, real close
     var b = s.as_bytes()
-    var pos = _simd_find2(b, 0, UInt8(ord("X")), UInt8(ord("Y")))
-    assert_eq_int(pos, len(b), "no match should return len(b), the same sentinel the scalar loop relied on")
+    var end = _skip_string(b, 0)
+    assert_eq_int(end, len(b), "unicode escape followed by another escape then the real terminator")
 
 
-def test_simd_find3_finds_third_target() raises:
-    var s = _padded(_SIMD_WIDTH + 2, "Z", 5)
+def test_skip_value_object_with_many_short_adjacent_string_fields() raises:
+    # Mirrors real FHIR shape (dense, many short key/value pairs close
+    # together, like Observation's `category`/`meta`) -- multiple quote
+    # hits packed within a single chunk, well under _SIMD_WIDTH apart.
+    var s = String('{"a":"1","b":"2","c":"3","d":"4","e":"5"}')
     var b = s.as_bytes()
-    var pos = _simd_find3(b, 0, UInt8(ord("X")), UInt8(ord("Y")), UInt8(ord("Z")))
-    assert_eq_int(pos, _SIMD_WIDTH + 2, "third target byte should be found across the chunk boundary")
+    var end = _skip_value(b, 0)
+    assert_eq_int(end, len(b), "dense object with many close-together hits must still skip correctly")
 
 
 # ── _skip_value ────────────────────────────────────────────────────────────
@@ -627,24 +635,24 @@ def test_shred_condition_fast_unicode_escape_in_skipped_field() raises:
 
 
 def main() raises:
-    test_simd_find2_candidate_at_width_minus_1()
-    print("PASS test_simd_find2_candidate_at_width_minus_1")
-    test_simd_find2_candidate_at_width()
-    print("PASS test_simd_find2_candidate_at_width")
-    test_simd_find2_candidate_at_width_plus_1()
-    print("PASS test_simd_find2_candidate_at_width_plus_1")
-    test_simd_find2_span_shorter_than_width()
-    print("PASS test_simd_find2_span_shorter_than_width")
-    test_simd_find2_span_not_multiple_of_width()
-    print("PASS test_simd_find2_span_not_multiple_of_width")
-    test_simd_find2_multiple_candidates_returns_first()
-    print("PASS test_simd_find2_multiple_candidates_returns_first")
-    test_simd_find2_backslash_as_last_byte()
-    print("PASS test_simd_find2_backslash_as_last_byte")
-    test_simd_find2_not_found_returns_length()
-    print("PASS test_simd_find2_not_found_returns_length")
-    test_simd_find3_finds_third_target()
-    print("PASS test_simd_find3_finds_third_target")
+    test_simd_find_first3_candidate_at_width_plus_2()
+    print("PASS test_simd_find_first3_candidate_at_width_plus_2")
+
+    test_simd_find_first2_candidate_at_width_minus_1()
+    print("PASS test_simd_find_first2_candidate_at_width_minus_1")
+    test_simd_find_first2_span_shorter_than_width()
+    print("PASS test_simd_find_first2_span_shorter_than_width")
+    test_simd_find_first2_not_found_returns_length()
+    print("PASS test_simd_find_first2_not_found_returns_length")
+
+    test_skip_string_escaped_quote_immediately_followed_by_real_quote()
+    print("PASS test_skip_string_escaped_quote_immediately_followed_by_real_quote")
+    test_skip_string_multiple_escaped_quotes_then_real_quote()
+    print("PASS test_skip_string_multiple_escaped_quotes_then_real_quote")
+    test_skip_string_unicode_escape_consuming_past_a_pending_hit()
+    print("PASS test_skip_string_unicode_escape_consuming_past_a_pending_hit")
+    test_skip_value_object_with_many_short_adjacent_string_fields()
+    print("PASS test_skip_value_object_with_many_short_adjacent_string_fields")
 
     test_skip_value_simple_string()
     print("PASS test_skip_value_simple_string")
