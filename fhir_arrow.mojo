@@ -45,7 +45,7 @@ def build_string_column(values: List[Optional[String]]) raises -> ArrowArray:
     a loop: the fix for the buffer-growth cost the v0 benchmark
     identified as one of the two dominant slowdowns versus Python."""
     var length = len(values)
-    var null_bits = List[Bool]()
+    var null_bits = List[Bool](capacity=length)
     var null_count = 0
     var total_bytes = 0
     for i in range(length):
@@ -93,9 +93,15 @@ def build_required_string_column(values: List[String]) raises -> ArrowArray:
 
 
 def build_float64_column(values: List[Optional[Float64]]) raises -> ArrowArray:
-    """Nullable Float64 column from a list of optional floats."""
+    """Nullable Float64 column from a list of optional floats.
+
+    null_bits is capacity-reserved up front (length is known before the
+    loop starts), so the `.append()` loop below never triggers a
+    reallocation: the same buffer-growth fix already applied to
+    build_string_column's value bytes, applied here to the bitmap-source
+    list instead."""
     var length = len(values)
-    var null_bits = List[Bool]()
+    var null_bits = List[Bool](capacity=length)
     var null_count = 0
     for i in range(length):
         if values[i]:
@@ -124,10 +130,12 @@ def build_float64_column(values: List[Optional[Float64]]) raises -> ArrowArray:
 
 def build_bool_column(values: List[Optional[Bool]]) raises -> ArrowArray:
     """Nullable Bool column. Values buffer is packed bits, LSB-first (same
-    scheme as the validity bitmap, per arrow.mojo's decode/encode)."""
+    scheme as the validity bitmap, per arrow.mojo's decode/encode).
+    Both bit-source lists are capacity-reserved up front, same reasoning
+    as build_float64_column's null_bits."""
     var length = len(values)
-    var null_bits = List[Bool]()
-    var value_bits = List[Bool]()
+    var null_bits = List[Bool](capacity=length)
+    var value_bits = List[Bool](capacity=length)
     var null_count = 0
     for i in range(length):
         if values[i]:
@@ -164,12 +172,13 @@ def patient_schema() -> ArrowSchema:
 
 
 def patients_to_record_batch(rows: List[PatientRow]) raises -> RecordBatch:
-    var ids = List[String]()
-    var genders = List[Optional[String]]()
-    var birth_dates = List[Optional[String]]()
-    var family_names = List[Optional[String]]()
-    var given_names = List[Optional[String]]()
-    var deceased = List[Optional[Bool]]()
+    var n = len(rows)
+    var ids = List[String](capacity=n)
+    var genders = List[Optional[String]](capacity=n)
+    var birth_dates = List[Optional[String]](capacity=n)
+    var family_names = List[Optional[String]](capacity=n)
+    var given_names = List[Optional[String]](capacity=n)
+    var deceased = List[Optional[Bool]](capacity=n)
     for i in range(len(rows)):
         ids.append(rows[i].id)
         genders.append(rows[i].gender)
@@ -216,16 +225,17 @@ def observation_schema() -> ArrowSchema:
 
 
 def observations_to_record_batch(rows: List[ObservationRow]) raises -> RecordBatch:
-    var ids = List[String]()
-    var patient_refs = List[Optional[String]]()
-    var codes = List[Optional[String]]()
-    var code_systems = List[Optional[String]]()
-    var code_displays = List[Optional[String]]()
-    var statuses = List[Optional[String]]()
-    var effective_datetimes = List[Optional[String]]()
-    var value_quantities = List[Optional[Float64]]()
-    var value_units = List[Optional[String]]()
-    var value_strings = List[Optional[String]]()
+    var n = len(rows)
+    var ids = List[String](capacity=n)
+    var patient_refs = List[Optional[String]](capacity=n)
+    var codes = List[Optional[String]](capacity=n)
+    var code_systems = List[Optional[String]](capacity=n)
+    var code_displays = List[Optional[String]](capacity=n)
+    var statuses = List[Optional[String]](capacity=n)
+    var effective_datetimes = List[Optional[String]](capacity=n)
+    var value_quantities = List[Optional[Float64]](capacity=n)
+    var value_units = List[Optional[String]](capacity=n)
+    var value_strings = List[Optional[String]](capacity=n)
     for i in range(len(rows)):
         ids.append(rows[i].id)
         patient_refs.append(rows[i].patient_ref)
@@ -277,13 +287,14 @@ def condition_schema() -> ArrowSchema:
 
 
 def conditions_to_record_batch(rows: List[ConditionRow]) raises -> RecordBatch:
-    var ids = List[String]()
-    var patient_refs = List[Optional[String]]()
-    var codes = List[Optional[String]]()
-    var code_displays = List[Optional[String]]()
-    var clinical_statuses = List[Optional[String]]()
-    var onset_datetimes = List[Optional[String]]()
-    var recorded_dates = List[Optional[String]]()
+    var n = len(rows)
+    var ids = List[String](capacity=n)
+    var patient_refs = List[Optional[String]](capacity=n)
+    var codes = List[Optional[String]](capacity=n)
+    var code_displays = List[Optional[String]](capacity=n)
+    var clinical_statuses = List[Optional[String]](capacity=n)
+    var onset_datetimes = List[Optional[String]](capacity=n)
+    var recorded_dates = List[Optional[String]](capacity=n)
     for i in range(len(rows)):
         ids.append(rows[i].id)
         patient_refs.append(rows[i].patient_ref)
@@ -330,19 +341,19 @@ def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raise
     var b = content.as_bytes()
 
     if kind == "Patient":
-        var rows = List[PatientRow]()
+        var rows = List[PatientRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_patient_fast(b[span[0] : span[1]]))
         patients_to_feather(rows, out_path)
     elif kind == "Observation":
-        var rows = List[ObservationRow]()
+        var rows = List[ObservationRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_observation_fast(b[span[0] : span[1]]))
         observations_to_feather(rows, out_path)
     elif kind == "Condition":
-        var rows = List[ConditionRow]()
+        var rows = List[ConditionRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_condition_fast(b[span[0] : span[1]]))
