@@ -172,3 +172,25 @@ def _find_key(b: Span[UInt8, _], obj_start: Int, key: String) raises -> Optional
             return Optional[Int](value_start)
 
         i = _skip_value(b, value_start)
+
+
+# ── _first_array_element ──────────────────────────────────────────────────────
+
+
+def _first_array_element(b: Span[UInt8, _], arr_start: Int) raises -> Optional[Int]:
+    """arr_start must point at '['. Returns the start index of the first
+    element (past any leading whitespace), or None if the array is empty."""
+    var n = len(b)
+    var i = arr_start
+    while i < n and _is_ws(b[i]):
+        i += 1
+    if i >= n or b[i] != _LBRACKET:
+        raise Error("fast_shred: _first_array_element: expected '[' at position " + String(arr_start))
+    i += 1  # skip '['
+    while i < n and _is_ws(b[i]):
+        i += 1
+    if i >= n:
+        raise Error("fast_shred: _first_array_element: unterminated array")
+    if b[i] == _RBRACKET:
+        return Optional[Int](None)
+    return Optional[Int](i)

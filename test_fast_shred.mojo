@@ -5,7 +5,7 @@
 # Section 2: shred_*_fast parity with test_resources.mojo's original cases.
 # Section 3: adversarial cases the tree parser never had to worry about.
 
-from fast_shred import _skip_value, _find_key
+from fast_shred import _skip_value, _find_key, _first_array_element
 
 
 def assert_true(cond: Bool, msg: String) raises:
@@ -160,6 +160,40 @@ def test_find_key_out_of_order_with_unknown_fields() raises:
     assert_true(Bool(gender_start), "gender should be found despite unrelated nested objects around it")
 
 
+# ── _first_array_element ──────────────────────────────────────────────────────
+
+
+def test_first_array_element_present() raises:
+    var s = String('[1, 2, 3]')
+    var b = s.as_bytes()
+    var start = _first_array_element(b, 0)
+    assert_true(Bool(start), "should find a first element")
+    assert_eq_int(start.value(), 1, "should point at the '1'")
+
+
+def test_first_array_element_empty_array() raises:
+    var s = String("[]")
+    var b = s.as_bytes()
+    var start = _first_array_element(b, 0)
+    assert_true(not Bool(start), "empty array has no first element")
+
+
+def test_first_array_element_of_objects() raises:
+    var s = String('[{"code": "a"}, {"code": "b"}]')
+    var b = s.as_bytes()
+    var start = _first_array_element(b, 0)
+    assert_true(Bool(start), "should find a first element")
+    assert_true(b[start.value()] == UInt8(ord("{")), "should point at the first object's opening brace")
+
+
+def test_first_array_element_skips_leading_whitespace() raises:
+    var s = String('[ "x", "y"]')
+    var b = s.as_bytes()
+    var start = _first_array_element(b, 0)
+    assert_true(Bool(start), "should find a first element")
+    assert_true(b[start.value()] == UInt8(ord('"')), "should point at the opening quote, past the leading space")
+
+
 def main() raises:
     test_skip_value_simple_string()
     print("PASS test_skip_value_simple_string")
@@ -192,5 +226,14 @@ def main() raises:
     print("PASS test_find_key_only_direct_keys_not_nested")
     test_find_key_out_of_order_with_unknown_fields()
     print("PASS test_find_key_out_of_order_with_unknown_fields")
+
+    test_first_array_element_present()
+    print("PASS test_first_array_element_present")
+    test_first_array_element_empty_array()
+    print("PASS test_first_array_element_empty_array")
+    test_first_array_element_of_objects()
+    print("PASS test_first_array_element_of_objects")
+    test_first_array_element_skips_leading_whitespace()
+    print("PASS test_first_array_element_skips_leading_whitespace")
 
     print("\nAll fast_shred primitive tests passed.")
