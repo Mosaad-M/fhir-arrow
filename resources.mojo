@@ -1,11 +1,12 @@
-# resources.mojo: FHIR resource shredders.
+# resources.mojo: FHIR resource row structs.
 #
-# Each shred_<resource>(obj: JsonValue) -> <Resource>Row flattens a subset of
-# a FHIR resource's fields (the v0 scope documented in the README) into a
-# plain row struct. Fields outside that scope are simply left null, not an
-# error: only a missing `id` raises.
-
-from json import JsonValue
+# The v0 field scope for each resource type (documented in the README) lives
+# here as plain row structs. The extraction logic that fills them lives in
+# fast_shred.mojo (shred_patient_fast/shred_observation_fast/
+# shred_condition_fast): a zero-tree byte scanner, not a JsonValue-tree
+# walk, since that tree-building step was the dominant cost identified by
+# the v0 benchmark. Only a missing `id` raises; every other v0 field is
+# simply left null when absent.
 
 
 # ── Patient ──────────────────────────────────────────────────────────────────
@@ -50,54 +51,6 @@ struct PatientRow(Copyable, Movable):
         self.family_name = move.family_name^
         self.given_name = move.given_name^
         self.deceased = move.deceased^
-
-
-def _opt_string(obj: JsonValue, key: String) raises -> Optional[String]:
-    if obj.has_key(key):
-        return Optional[String](obj.get_string(key))
-    return Optional[String](None)
-
-
-def _coding0(obj: JsonValue) raises -> Optional[JsonValue]:
-    """First entry of obj.code.coding[], if code/coding are present and non-empty."""
-    if not obj.has_key("code"):
-        return Optional[JsonValue](None)
-    var code = obj.get("code")
-    if not code.has_key("coding") or code.get_array_len("coding") == 0:
-        return Optional[JsonValue](None)
-    return Optional[JsonValue](code.get("coding").get(0))
-
-
-def shred_patient(obj: JsonValue) raises -> PatientRow:
-    """Flatten a FHIR Patient resource into a PatientRow.
-
-    v0 scope: id, gender, birthDate, name[0].family, name[0].given[0],
-    deceasedBoolean. `deceasedDateTime` and additional name entries are out
-    of scope and left null.
-    """
-    if not obj.has_key("id"):
-        raise Error("resources: shred_patient: missing required field 'id'")
-    var id = obj.get_string("id")
-
-    var gender = _opt_string(obj, "gender")
-    var birth_date = _opt_string(obj, "birthDate")
-
-    var family_name = Optional[String](None)
-    var given_name = Optional[String](None)
-    if obj.has_key("name") and obj.get_array_len("name") > 0:
-        var name0 = obj.get("name").get(0)
-        if name0.has_key("family"):
-            family_name = Optional[String](name0.get_string("family"))
-        if name0.has_key("given") and name0.get_array_len("given") > 0:
-            given_name = Optional[String](name0.get("given").get_string(0))
-
-    var deceased = Optional[Bool](None)
-    if obj.has_key("deceasedBoolean"):
-        deceased = Optional[Bool](obj.get_bool("deceasedBoolean"))
-
-    return PatientRow(
-        id, gender, birth_date, family_name, given_name, deceased
-    )
 
 
 # ── Observation ──────────────────────────────────────────────────────────────
@@ -164,65 +117,6 @@ struct ObservationRow(Copyable, Movable):
         self.value_string = move.value_string^
 
 
-def shred_observation(obj: JsonValue) raises -> ObservationRow:
-    """Flatten a FHIR Observation resource into an ObservationRow.
-
-    v0 scope: id, subject.reference, code.coding[0] (code/system/display),
-    status, effectiveDateTime, and the polymorphic value: valueQuantity
-    (value + unit) OR valueString. Other value[x] variants (e.g.
-    valueCodeableConcept) are out of scope: both value columns are left
-    null, not an error.
-    """
-    if not obj.has_key("id"):
-        raise Error("resources: shred_observation: missing required field 'id'")
-    var id = obj.get_string("id")
-
-    var patient_ref = Optional[String](None)
-    if obj.has_key("subject") and obj.get("subject").has_key("reference"):
-        patient_ref = Optional[String](obj.get("subject").get_string("reference"))
-
-    var code = Optional[String](None)
-    var code_system = Optional[String](None)
-    var code_display = Optional[String](None)
-    var coding0 = _coding0(obj)
-    if coding0:
-        var c0 = coding0.value().copy()
-        if c0.has_key("code"):
-            code = Optional[String](c0.get_string("code"))
-        if c0.has_key("system"):
-            code_system = Optional[String](c0.get_string("system"))
-        if c0.has_key("display"):
-            code_display = Optional[String](c0.get_string("display"))
-
-    var status = _opt_string(obj, "status")
-    var effective_datetime = _opt_string(obj, "effectiveDateTime")
-
-    var value_quantity = Optional[Float64](None)
-    var value_unit = Optional[String](None)
-    var value_string = Optional[String](None)
-    if obj.has_key("valueQuantity"):
-        var vq = obj.get("valueQuantity")
-        if vq.has_key("value"):
-            value_quantity = Optional[Float64](vq.get_number("value"))
-        if vq.has_key("unit"):
-            value_unit = Optional[String](vq.get_string("unit"))
-    elif obj.has_key("valueString"):
-        value_string = Optional[String](obj.get_string("valueString"))
-
-    return ObservationRow(
-        id,
-        patient_ref,
-        code,
-        code_system,
-        code_display,
-        status,
-        effective_datetime,
-        value_quantity,
-        value_unit,
-        value_string,
-    )
-
-
 # ── Condition ────────────────────────────────────────────────────────────────
 
 
@@ -270,51 +164,3 @@ struct ConditionRow(Copyable, Movable):
         self.clinical_status = move.clinical_status^
         self.onset_datetime = move.onset_datetime^
         self.recorded_date = move.recorded_date^
-
-
-def shred_condition(obj: JsonValue) raises -> ConditionRow:
-    """Flatten a FHIR Condition resource into a ConditionRow.
-
-    v0 scope: id, subject.reference, code.coding[0] (code/display),
-    clinicalStatus.coding[0].code, onsetDateTime, recordedDate. Other
-    onset[x] variants (e.g. onsetAge, onsetPeriod) are out of scope and
-    left null.
-    """
-    if not obj.has_key("id"):
-        raise Error("resources: shred_condition: missing required field 'id'")
-    var id = obj.get_string("id")
-
-    var patient_ref = Optional[String](None)
-    if obj.has_key("subject") and obj.get("subject").has_key("reference"):
-        patient_ref = Optional[String](obj.get("subject").get_string("reference"))
-
-    var code = Optional[String](None)
-    var code_display = Optional[String](None)
-    var coding0 = _coding0(obj)
-    if coding0:
-        var c0 = coding0.value().copy()
-        if c0.has_key("code"):
-            code = Optional[String](c0.get_string("code"))
-        if c0.has_key("display"):
-            code_display = Optional[String](c0.get_string("display"))
-
-    var clinical_status = Optional[String](None)
-    if obj.has_key("clinicalStatus"):
-        var cs = obj.get("clinicalStatus")
-        if cs.has_key("coding") and cs.get_array_len("coding") > 0:
-            var cs0 = cs.get("coding").get(0)
-            if cs0.has_key("code"):
-                clinical_status = Optional[String](cs0.get_string("code"))
-
-    var onset_datetime = _opt_string(obj, "onsetDateTime")
-    var recorded_date = _opt_string(obj, "recordedDate")
-
-    return ConditionRow(
-        id,
-        patient_ref,
-        code,
-        code_display,
-        clinical_status,
-        onset_datetime,
-        recorded_date,
-    )

@@ -13,7 +13,7 @@
 #     DIRECT (non-nested) keys of the object starting at obj_start, or None.
 # Everything else (name[0].family, code.coding[0].code, subject.reference,
 # the polymorphic valueQuantity/valueString, ...) is built from repeated
-# calls to these two, matching resources.mojo's field list exactly — no
+# calls to these two, matching resources.mojo's field list exactly: no
 # generic path-expression engine on top of them.
 #
 # Trade-off, accepted and documented in the README: this hand-rolled scanner
@@ -281,7 +281,7 @@ def _coding0_fast(b: Span[UInt8, _], obj_start: Int) raises -> Optional[Int]:
 
 
 def shred_patient_fast(line: String) raises -> PatientRow:
-    """Zero-tree equivalent of resources.mojo's shred_patient — same v0
+    """Zero-tree equivalent of resources.mojo's shred_patient: same v0
     field scope, same behavior on missing/optional fields."""
     var b = line.as_bytes()
 

@@ -6,7 +6,7 @@
 from std.time import perf_counter_ns
 from std.sys import argv
 from fhir_arrow import ndjson_to_feather
-from ndjson import read_ndjson
+from ndjson import read_ndjson_lines
 
 
 def _run_one(label: String, ndjson_path: String, out_path: String, kind: String) raises:
@@ -15,8 +15,8 @@ def _run_one(label: String, ndjson_path: String, out_path: String, kind: String)
     var elapsed_ns: Int = perf_counter_ns() - t0
     var elapsed_ms = Float64(elapsed_ns) / 1_000_000.0
 
-    var records = read_ndjson(ndjson_path)
-    var n = len(records)
+    var lines = read_ndjson_lines(ndjson_path)
+    var n = len(lines)
     var rows_per_sec = Float64(n) / (Float64(elapsed_ns) / 1_000_000_000.0)
 
     print(

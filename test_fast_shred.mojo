@@ -49,7 +49,7 @@ def test_skip_value_simple_string() raises:
 
 
 def test_skip_value_string_with_escaped_quote() raises:
-    # "a\"b" — the \" must not be mistaken for the closing quote.
+    # "a\"b": the \" must not be mistaken for the closing quote.
     var s = String('"a\\"b", "next"')
     var b = s.as_bytes()
     var end = _skip_value(b, 0)

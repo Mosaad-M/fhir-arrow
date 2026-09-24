@@ -11,11 +11,10 @@ from arrow import (
     encode_arrow_file,
 )
 from flatbuffers import write_i32_le, write_f64_le
-from ndjson import read_ndjson
-from resources import (
-    PatientRow, shred_patient,
-    ObservationRow, shred_observation,
-    ConditionRow, shred_condition,
+from ndjson import read_ndjson_lines
+from resources import PatientRow, ObservationRow, ConditionRow
+from fast_shred import (
+    shred_patient_fast, shred_observation_fast, shred_condition_fast,
 )
 
 
@@ -43,7 +42,7 @@ def build_string_column(values: List[Optional[String]]) raises -> ArrowArray:
 
     value_bytes is pre-sized once (total byte length computed up front)
     and filled via indexed writes rather than growing via `.append()` in
-    a loop — the fix for the buffer-growth cost the v0 benchmark
+    a loop: the fix for the buffer-growth cost the v0 benchmark
     identified as one of the two dominant slowdowns versus Python."""
     var length = len(values)
     var null_bits = List[Bool]()
@@ -320,23 +319,25 @@ def conditions_to_feather(rows: List[ConditionRow], path: String) raises:
 def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raises:
     """Read a Bulk FHIR NDJSON export file of one resource type and write a
     Feather file of its shredded columns. `kind` is one of "Patient",
-    "Observation", "Condition"."""
-    var records = read_ndjson(ndjson_path)
+    "Observation", "Condition". Uses the zero-tree fast_shred path: raw
+    lines are never parsed into a JsonValue tree, only the specific fields
+    each row struct needs are ever decoded."""
+    var lines = read_ndjson_lines(ndjson_path)
 
     if kind == "Patient":
         var rows = List[PatientRow]()
-        for i in range(len(records)):
-            rows.append(shred_patient(records[i]))
+        for i in range(len(lines)):
+            rows.append(shred_patient_fast(lines[i]))
         patients_to_feather(rows, out_path)
     elif kind == "Observation":
         var rows = List[ObservationRow]()
-        for i in range(len(records)):
-            rows.append(shred_observation(records[i]))
+        for i in range(len(lines)):
+            rows.append(shred_observation_fast(lines[i]))
         observations_to_feather(rows, out_path)
     elif kind == "Condition":
         var rows = List[ConditionRow]()
-        for i in range(len(records)):
-            rows.append(shred_condition(records[i]))
+        for i in range(len(lines)):
+            rows.append(shred_condition_fast(lines[i]))
         conditions_to_feather(rows, out_path)
     else:
         raise Error(
