@@ -1,15 +1,16 @@
 # fhir-arrow: Bulk FHIR NDJSON to Apache Arrow (Feather), in pure Mojo
 
 Shreds Bulk FHIR `$export` NDJSON files (Patient, Observation, Condition)
-into columnar `.feather` files, using a pure-Mojo JSON parser and a pure-Mojo
-Arrow IPC encoder. No Python, no C dependencies.
+into columnar `.feather` files, using a hand-rolled zero-tree byte scanner
+(no JSON tree is ever built) and a pure-Mojo Arrow IPC encoder. No Python,
+no C dependencies.
 
 ## Quick start
 
 ```bash
-pixi install                        # resolves arrow + json (git deps)
+pixi install                        # resolves arrow (git dep)
 pixi run test-ndjson                # 4 tests
-pixi run test-resources             # 11 tests
+pixi run test-fast-shred            # 35 tests
 pixi run test-fhir-arrow            # 5 tests
 ```
 
@@ -39,18 +40,22 @@ print(f.read_table("patients.feather"))
 NDJSON file (one FHIR resource per line)
         |
         v
-  read_ndjson()          ndjson.mojo: json.mojo's parse_json() per line
+  read_ndjson_lines()    ndjson.mojo: splits into raw line Strings.
+        |                No JSON parsing happens here at all.
+        v
+  List[String]
         |
         v
-  List[JsonValue]
-        |
-        v
-  shred_patient() / shred_observation() / shred_condition()
-        |                resources.mojo: walks known FHIR paths
-        |                (name[0].family, code.coding[0], the
-        |                 value[x] polymorphic choice, ...) into
-        |                a flat row struct. Only `id` is required;
-        |                everything else missing = null, not an error.
+  shred_patient_fast() / shred_observation_fast() / shred_condition_fast()
+        |                fast_shred.mojo: scans each line's raw bytes
+        |                directly and decodes ONLY the handful of known
+        |                fields the v0 schema cares about (name[0].family,
+        |                code.coding[0], the value[x] polymorphic choice,
+        |                ...). Everything else is skipped in O(bytes)
+        |                without ever allocating a representation for it.
+        |                No JsonValue tree is built for the resource as a
+        |                whole. Only `id` is required; everything else
+        |                missing = null, not an error.
         v
   List[PatientRow] / List[ObservationRow] / List[ConditionRow]
         |
@@ -59,7 +64,10 @@ NDJSON file (one FHIR resource per line)
         |                fhir_arrow.mojo: one column builder per Arrow
         |                type (Utf8/Float64/Bool), assembled into a
         |                RecordBatch, encoded via arrow.mojo's legacy
-        |                ArrowType/ArrowArray/encode_arrow_file API
+        |                ArrowType/ArrowArray/encode_arrow_file API.
+        |                String columns are pre-sized once from a total
+        |                byte-length pass, then filled via indexed writes,
+        |                not grown one byte at a time via `.append()`.
         v
   patients.feather / observations.feather / conditions.feather
 ```
@@ -73,6 +81,20 @@ This targets `arrow.mojo`'s **legacy** `ArrowType`/`ArrowArray`/
 not the newer `dtypes`/`arrays`/`builders.mojo` typed-builder API: as of
 `arrow` v1.1.0 there's no bridge from the typed builders to file encoding
 yet.
+
+**Why a hand-rolled byte scanner instead of a general JSON parser**: v0 of
+this repo used `json.mojo` (a general-purpose recursive-descent parser) to
+build a full `JsonValue` tree per record, then read a handful of fields out
+of it. That tree-building step turned out to dominate the cost (see
+Benchmark below): real Synthea Observations carry dozens of fields
+(`meta`, `text`, `category`, `encounter`, `performer`, `referenceRange`,
+...) this schema never reads, and every one of them still got parsed and
+heap-allocated. `fast_shred.mojo` scans past all of that in raw bytes
+without allocating anything for it, and only decodes the ~7-10 fields per
+resource type this schema actually extracts. The trade-off, accepted and
+intentional: this scanner is less forgiving of malformed or unexpected JSON
+shapes than a general tree parser would be. It's a narrow shredder for a
+known schema, not a general-purpose FHIR parser.
 
 ## Field mapping (v0 scope)
 
@@ -129,39 +151,61 @@ pixi run mojo run $(cat .mojo_flags) bench_fhir_arrow.mojo <synthea_fhir_dir> <o
 python3 bench/bench_python.py <synthea_fhir_dir> <out_dir>
 ```
 
-| Resource | Mojo (this repo) | Python (json + pandas/pyarrow) |
+### v0: json.mojo tree parser + byte-by-byte buffers (superseded)
+
+| Resource | Mojo (v0) | Python (json + pandas/pyarrow) |
 |---|---|---|
 | Patient (577 rows) | 28.7 ms, 20,088 rows/sec | 34.3 ms, 16,841 rows/sec |
 | Observation (266,750 rows) | 5,434.0 ms, 49,089 rows/sec | 2,519.0 ms, 105,896 rows/sec |
 | Condition (19,025 rows) | 390.3 ms, 48,751 rows/sec | 154.8 ms, 122,905 rows/sec |
 
-**Honest result: as of this v0, the Python baseline is faster, roughly 2 to
-2.5x on Observation and Condition.** This contradicts what was originally
-expected going in; reporting the real measured numbers rather than the
-hoped-for ones. The gap traces to two concrete, fixable causes, not to a
-ceiling on what Mojo can do here:
+The first version of this pipeline used `json.mojo` to parse every record
+into a full `JsonValue` tree before reading a handful of fields out of it,
+and grew Arrow column buffers one byte/bit at a time via `List.append`
+with no capacity pre-reservation. Measured against real Synthea data, that
+version was **slower than the Python baseline, roughly 2 to 2.5x on
+Observation and Condition**, the opposite of what this project was
+pitched on. Root cause was two concrete, fixable things, not a ceiling on
+what Mojo can do here:
 
-1. **JSON parsing dominates the cost, and `json.mojo` is a general-purpose
-   recursive-descent parser that heap-allocates a full `JsonValue` tree per
-   record** (one `alloc()` per nested array/object, walked through
-   `Optional[Pointer[...]]` indirection). CPython's `json` module is a
-   mature, heavily optimized C extension; a heap-allocating tree-walking
-   parser in Mojo has no structural advantage over it and pays real
-   allocation overhead this workload doesn't need, since only a handful of
-   known fields are ever read out of each parsed tree.
-2. **The column builders in `fhir_arrow.mojo` grow buffers one byte/bit at a
-   time via `List.append`** (see `build_string_column`, `_pack_bits`), with
-   no capacity pre-reservation, versus pandas/pyarrow's vectorized C++
-   internals.
+1. **JSON tree-building dominated the cost.** Real Synthea Observations
+   carry dozens of fields this schema never reads (`meta`, `text`,
+   `category`, `encounter`, `performer`, `referenceRange`, ...), and every
+   one of them still got parsed and heap-allocated into the tree.
+   CPython's `json` module is a mature, heavily optimized C extension; a
+   heap-allocating tree-walking parser in Mojo had no structural advantage
+   over it for this workload.
+2. **`build_string_column` grew its value buffer one byte at a time** via
+   `List.append` in a loop, with no capacity pre-reservation, versus
+   pandas/pyarrow's vectorized C++ internals.
 
-The fix for (1) is exactly the SIMD/zero-copy "narrow shredder" approach
-this project was originally motivated by: scan each NDJSON line's bytes
-directly for the handful of known field paths this repo actually extracts,
-instead of materializing a full generic JSON tree first. That's future work,
-not implemented in this v0: the honest scope of this repo right now is a
-**correct, TDD-verified, real-Feather-writing pipeline**, not yet a fast
-one. Fixing (2) (pre-sized buffers, direct byte writes instead of
-`List.append`) is a smaller, more mechanical follow-up.
+### v1: zero-tree byte scanner + pre-sized buffers (current)
+
+Fixed both: `fast_shred.mojo` replaced the `json.mojo`-tree path with a
+hand-rolled scanner that never builds a tree at all (see Architecture
+above), and `build_string_column` now pre-sizes its buffer from a
+total-byte-length pass and writes via indexed assignment instead of
+`.append()`. Same dataset, same machine, re-run back to back:
+
+| Resource | Mojo (v1) | Python | v1 vs v0 | v1 vs Python |
+|---|---|---|---|---|
+| Patient (577 rows) | 10.4 ms, 55,353 rows/sec | 24.5 ms, 23,589 rows/sec | 2.76x faster | **Mojo 2.35x faster** |
+| Observation (266,750 rows) | 2,702.6 ms, 98,700 rows/sec | 2,504.0 ms, 106,529 rows/sec | 2.01x faster | Python 1.08x faster |
+| Condition (19,025 rows) | 184.1 ms, 103,347 rows/sec | 154.6 ms, 123,040 rows/sec | 2.12x faster | Python 1.19x faster |
+
+**Honest result: Patient now beats Python outright. Observation and
+Condition improved ~2x over v0 but still trail Python by 8-19%, the gap
+narrowed a lot, it didn't fully close.** Reporting this as measured, not
+rounded off. The most likely remaining cost, based on the v0 diagnosis
+holding directionally: `_find_key` re-scans an object's keys from the start
+for each field it's asked to find (a handful of independent linear scans
+per record rather than one true single pass collecting every wanted field
+in one traversal), and CPython's `json` module is still doing raw parsing
+in optimized C that a byte-level scan in Mojo has to out-throughput, not
+just out-allocate, to fully win on the larger/more field-heavy resource
+types. A genuinely single-pass, multi-key scanner is the natural next
+optimization if closing this the rest of the way matters more than the
+Patient result already achieved.
 
 ## Known limitations
 
@@ -184,13 +228,20 @@ one. Fixing (2) (pre-sized buffers, direct byte writes instead of
   is dropped, not preserved in an "extra fields" column.
 - `id` is the only field treated as required; every other field's absence
   is a null in that row, not an error.
-- No streaming: `read_ndjson` loads the whole file into memory as
-  `List[JsonValue]` before shredding. Fine for the benchmark sizes here;
-  would need reworking for exports too large to fit in memory.
+- No streaming: `read_ndjson_lines` loads the whole file into memory as
+  `List[String]` before shredding. Lighter than v0's `List[JsonValue]` (no
+  tree per line), but still not streaming; would need reworking for exports
+  too large to fit in memory.
+- `fast_shred.mojo`'s byte scanner is intentionally narrow, not a general
+  JSON parser: it's built to shred exactly the field paths listed above
+  correctly (including realistic adversarial cases like escaped characters
+  and out-of-order keys, see `test_fast_shred.mojo`), not to handle
+  arbitrary or malformed JSON gracefully the way `json.mojo`'s tree parser
+  would. This trade-off is intentional (see Architecture above), not an
+  oversight.
 
 ## Dependencies
 
-- [json](https://github.com/Mosaad-M/json) `>=1.1.0`: pure-Mojo JSON parser
 - [arrow](https://github.com/Mosaad-M/arrow) `>=1.1.0`: pure-Mojo Arrow IPC
   encoder/decoder (pulls in `flatbuffers` transitively)
 
