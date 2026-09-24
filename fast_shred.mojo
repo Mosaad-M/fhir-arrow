@@ -332,14 +332,16 @@ def _extract_bool(b: Span[UInt8, _], start: Int) raises -> Bool:
     raise Error("fast_shred: _extract_bool: expected true/false at " + String(start))
 
 
-# ── Shared: first coding[0] of obj.code (mirrors resources.mojo's _coding0) ──
+# ── Shared: first coding[0] of a `code` CodeableConcept object already ──────
+#    located by the caller (mirrors resources.mojo's _coding0) ─────────────
 
 
-def _coding0_fast(b: Span[UInt8, _], obj_start: Int) raises -> Optional[Int]:
-    var code_start = _find_key(b, obj_start, "code")
-    if not code_start:
-        return Optional[Int](None)
-    var coding_start = _find_key(b, code_start.value(), "coding")
+def _coding0_at(b: Span[UInt8, _], code_start: Int) raises -> Optional[Int]:
+    """Given the start of a `code` object (already found by the caller,
+    typically via a batched _find_keys pass), return the start index of
+    code.coding[0], or None. Takes code_start directly rather than
+    re-finding "code" from scratch, since the caller already has it."""
+    var coding_start = _find_key(b, code_start, "coding")
     if not coding_start:
         return Optional[Int](None)
     return _first_array_element(b, coding_start.value())
@@ -350,43 +352,43 @@ def _coding0_fast(b: Span[UInt8, _], obj_start: Int) raises -> Optional[Int]:
 
 def shred_patient_fast(line: String) raises -> PatientRow:
     """Zero-tree equivalent of resources.mojo's shred_patient: same v0
-    field scope, same behavior on missing/optional fields."""
+    field scope, same behavior on missing/optional fields. Resolves all
+    five top-level fields in a single pass over the object via _find_keys,
+    instead of one full re-scan per field."""
     var b = line.as_bytes()
 
-    var id_start = _find_key(b, 0, "id")
-    if not id_start:
+    var top_keys: List[String] = ["id", "gender", "birthDate", "name", "deceasedBoolean"]
+    var top = _find_keys(b, 0, top_keys)
+
+    if not top[0]:
         raise Error("fast_shred: shred_patient_fast: missing required field 'id'")
-    var id = _extract_string(b, id_start.value())
+    var id = _extract_string(b, top[0].value())
 
     var gender = Optional[String](None)
-    var gender_start = _find_key(b, 0, "gender")
-    if gender_start:
-        gender = Optional[String](_extract_string(b, gender_start.value()))
+    if top[1]:
+        gender = Optional[String](_extract_string(b, top[1].value()))
 
     var birth_date = Optional[String](None)
-    var birth_date_start = _find_key(b, 0, "birthDate")
-    if birth_date_start:
-        birth_date = Optional[String](_extract_string(b, birth_date_start.value()))
+    if top[2]:
+        birth_date = Optional[String](_extract_string(b, top[2].value()))
 
     var family_name = Optional[String](None)
     var given_name = Optional[String](None)
-    var name_start = _find_key(b, 0, "name")
-    if name_start:
-        var name0_start = _first_array_element(b, name_start.value())
+    if top[3]:
+        var name0_start = _first_array_element(b, top[3].value())
         if name0_start:
-            var family_start = _find_key(b, name0_start.value(), "family")
-            if family_start:
-                family_name = Optional[String](_extract_string(b, family_start.value()))
-            var given_arr_start = _find_key(b, name0_start.value(), "given")
-            if given_arr_start:
-                var given0_start = _first_array_element(b, given_arr_start.value())
+            var name_keys: List[String] = ["family", "given"]
+            var name_fields = _find_keys(b, name0_start.value(), name_keys)
+            if name_fields[0]:
+                family_name = Optional[String](_extract_string(b, name_fields[0].value()))
+            if name_fields[1]:
+                var given0_start = _first_array_element(b, name_fields[1].value())
                 if given0_start:
                     given_name = Optional[String](_extract_string(b, given0_start.value()))
 
     var deceased = Optional[Bool](None)
-    var deceased_start = _find_key(b, 0, "deceasedBoolean")
-    if deceased_start:
-        deceased = Optional[Bool](_extract_bool(b, deceased_start.value()))
+    if top[4]:
+        deceased = Optional[Bool](_extract_bool(b, top[4].value()))
 
     return PatientRow(id, gender, birth_date, family_name, given_name, deceased)
 
@@ -395,63 +397,62 @@ def shred_patient_fast(line: String) raises -> PatientRow:
 
 
 def shred_observation_fast(line: String) raises -> ObservationRow:
-    """Zero-tree equivalent of resources.mojo's shred_observation."""
+    """Zero-tree equivalent of resources.mojo's shred_observation. Resolves
+    all seven top-level fields in a single pass via _find_keys, instead of
+    six separate full re-scans of the same object."""
     var b = line.as_bytes()
 
-    var id_start = _find_key(b, 0, "id")
-    if not id_start:
+    var top_keys: List[String] = [
+        "id", "subject", "code", "status", "effectiveDateTime",
+        "valueQuantity", "valueString",
+    ]
+    var top = _find_keys(b, 0, top_keys)
+
+    if not top[0]:
         raise Error("fast_shred: shred_observation_fast: missing required field 'id'")
-    var id = _extract_string(b, id_start.value())
+    var id = _extract_string(b, top[0].value())
 
     var patient_ref = Optional[String](None)
-    var subject_start = _find_key(b, 0, "subject")
-    if subject_start:
-        var ref_start = _find_key(b, subject_start.value(), "reference")
+    if top[1]:
+        var ref_start = _find_key(b, top[1].value(), "reference")
         if ref_start:
             patient_ref = Optional[String](_extract_string(b, ref_start.value()))
 
     var code = Optional[String](None)
     var code_system = Optional[String](None)
     var code_display = Optional[String](None)
-    var coding0_start = _coding0_fast(b, 0)
-    if coding0_start:
-        var c0 = coding0_start.value()
-        var code_field = _find_key(b, c0, "code")
-        if code_field:
-            code = Optional[String](_extract_string(b, code_field.value()))
-        var system_field = _find_key(b, c0, "system")
-        if system_field:
-            code_system = Optional[String](_extract_string(b, system_field.value()))
-        var display_field = _find_key(b, c0, "display")
-        if display_field:
-            code_display = Optional[String](_extract_string(b, display_field.value()))
+    if top[2]:
+        var coding0_start = _coding0_at(b, top[2].value())
+        if coding0_start:
+            var coding_keys: List[String] = ["code", "system", "display"]
+            var coding_fields = _find_keys(b, coding0_start.value(), coding_keys)
+            if coding_fields[0]:
+                code = Optional[String](_extract_string(b, coding_fields[0].value()))
+            if coding_fields[1]:
+                code_system = Optional[String](_extract_string(b, coding_fields[1].value()))
+            if coding_fields[2]:
+                code_display = Optional[String](_extract_string(b, coding_fields[2].value()))
 
     var status = Optional[String](None)
-    var status_start = _find_key(b, 0, "status")
-    if status_start:
-        status = Optional[String](_extract_string(b, status_start.value()))
+    if top[3]:
+        status = Optional[String](_extract_string(b, top[3].value()))
 
     var effective_datetime = Optional[String](None)
-    var eff_start = _find_key(b, 0, "effectiveDateTime")
-    if eff_start:
-        effective_datetime = Optional[String](_extract_string(b, eff_start.value()))
+    if top[4]:
+        effective_datetime = Optional[String](_extract_string(b, top[4].value()))
 
     var value_quantity = Optional[Float64](None)
     var value_unit = Optional[String](None)
     var value_string = Optional[String](None)
-    var vq_start = _find_key(b, 0, "valueQuantity")
-    if vq_start:
-        var vq = vq_start.value()
-        var val_field = _find_key(b, vq, "value")
-        if val_field:
-            value_quantity = Optional[Float64](_extract_number(b, val_field.value()))
-        var unit_field = _find_key(b, vq, "unit")
-        if unit_field:
-            value_unit = Optional[String](_extract_string(b, unit_field.value()))
-    else:
-        var vs_start = _find_key(b, 0, "valueString")
-        if vs_start:
-            value_string = Optional[String](_extract_string(b, vs_start.value()))
+    if top[5]:
+        var vq_keys: List[String] = ["value", "unit"]
+        var vq_fields = _find_keys(b, top[5].value(), vq_keys)
+        if vq_fields[0]:
+            value_quantity = Optional[Float64](_extract_number(b, vq_fields[0].value()))
+        if vq_fields[1]:
+            value_unit = Optional[String](_extract_string(b, vq_fields[1].value()))
+    elif top[6]:
+        value_string = Optional[String](_extract_string(b, top[6].value()))
 
     return ObservationRow(
         id,
@@ -471,37 +472,41 @@ def shred_observation_fast(line: String) raises -> ObservationRow:
 
 
 def shred_condition_fast(line: String) raises -> ConditionRow:
-    """Zero-tree equivalent of resources.mojo's shred_condition."""
+    """Zero-tree equivalent of resources.mojo's shred_condition. Resolves
+    all six top-level fields in a single pass via _find_keys, instead of
+    six separate full re-scans of the same object."""
     var b = line.as_bytes()
 
-    var id_start = _find_key(b, 0, "id")
-    if not id_start:
+    var top_keys: List[String] = [
+        "id", "subject", "code", "clinicalStatus", "onsetDateTime", "recordedDate",
+    ]
+    var top = _find_keys(b, 0, top_keys)
+
+    if not top[0]:
         raise Error("fast_shred: shred_condition_fast: missing required field 'id'")
-    var id = _extract_string(b, id_start.value())
+    var id = _extract_string(b, top[0].value())
 
     var patient_ref = Optional[String](None)
-    var subject_start = _find_key(b, 0, "subject")
-    if subject_start:
-        var ref_start = _find_key(b, subject_start.value(), "reference")
+    if top[1]:
+        var ref_start = _find_key(b, top[1].value(), "reference")
         if ref_start:
             patient_ref = Optional[String](_extract_string(b, ref_start.value()))
 
     var code = Optional[String](None)
     var code_display = Optional[String](None)
-    var coding0_start = _coding0_fast(b, 0)
-    if coding0_start:
-        var c0 = coding0_start.value()
-        var code_field = _find_key(b, c0, "code")
-        if code_field:
-            code = Optional[String](_extract_string(b, code_field.value()))
-        var display_field = _find_key(b, c0, "display")
-        if display_field:
-            code_display = Optional[String](_extract_string(b, display_field.value()))
+    if top[2]:
+        var coding0_start = _coding0_at(b, top[2].value())
+        if coding0_start:
+            var coding_keys: List[String] = ["code", "display"]
+            var coding_fields = _find_keys(b, coding0_start.value(), coding_keys)
+            if coding_fields[0]:
+                code = Optional[String](_extract_string(b, coding_fields[0].value()))
+            if coding_fields[1]:
+                code_display = Optional[String](_extract_string(b, coding_fields[1].value()))
 
     var clinical_status = Optional[String](None)
-    var cs_start = _find_key(b, 0, "clinicalStatus")
-    if cs_start:
-        var cs_coding_start = _find_key(b, cs_start.value(), "coding")
+    if top[3]:
+        var cs_coding_start = _find_key(b, top[3].value(), "coding")
         if cs_coding_start:
             var cs0_start = _first_array_element(b, cs_coding_start.value())
             if cs0_start:
@@ -510,14 +515,12 @@ def shred_condition_fast(line: String) raises -> ConditionRow:
                     clinical_status = Optional[String](_extract_string(b, cs_code_field.value()))
 
     var onset_datetime = Optional[String](None)
-    var onset_start = _find_key(b, 0, "onsetDateTime")
-    if onset_start:
-        onset_datetime = Optional[String](_extract_string(b, onset_start.value()))
+    if top[4]:
+        onset_datetime = Optional[String](_extract_string(b, top[4].value()))
 
     var recorded_date = Optional[String](None)
-    var recorded_start = _find_key(b, 0, "recordedDate")
-    if recorded_start:
-        recorded_date = Optional[String](_extract_string(b, recorded_start.value()))
+    if top[5]:
+        recorded_date = Optional[String](_extract_string(b, top[5].value()))
 
     return ConditionRow(
         id,
