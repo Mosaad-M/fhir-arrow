@@ -15,8 +15,8 @@ def _run_one(label: String, ndjson_path: String, out_path: String, kind: String)
     var elapsed_ns: Int = perf_counter_ns() - t0
     var elapsed_ms = Float64(elapsed_ns) / 1_000_000.0
 
-    var lines = read_ndjson_lines(ndjson_path)
-    var n = len(lines)
+    var result = read_ndjson_lines(ndjson_path)
+    var n = len(result[1])
     var rows_per_sec = Float64(n) / (Float64(elapsed_ns) / 1_000_000_000.0)
 
     print(

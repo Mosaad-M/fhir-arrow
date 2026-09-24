@@ -321,23 +321,31 @@ def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raise
     Feather file of its shredded columns. `kind` is one of "Patient",
     "Observation", "Condition". Uses the zero-tree fast_shred path: raw
     lines are never parsed into a JsonValue tree, only the specific fields
-    each row struct needs are ever decoded."""
-    var lines = read_ndjson_lines(ndjson_path)
+    each row struct needs are ever decoded. The file is read once into one
+    buffer; each record is shredded directly from a byte-span slice of
+    that buffer, with no per-line String allocated to read it."""
+    var result = read_ndjson_lines(ndjson_path)
+    var content = result[0]
+    var spans = result[1].copy()
+    var b = content.as_bytes()
 
     if kind == "Patient":
         var rows = List[PatientRow]()
-        for i in range(len(lines)):
-            rows.append(shred_patient_fast(lines[i]))
+        for i in range(len(spans)):
+            var span = spans[i]
+            rows.append(shred_patient_fast(b[span[0] : span[1]]))
         patients_to_feather(rows, out_path)
     elif kind == "Observation":
         var rows = List[ObservationRow]()
-        for i in range(len(lines)):
-            rows.append(shred_observation_fast(lines[i]))
+        for i in range(len(spans)):
+            var span = spans[i]
+            rows.append(shred_observation_fast(b[span[0] : span[1]]))
         observations_to_feather(rows, out_path)
     elif kind == "Condition":
         var rows = List[ConditionRow]()
-        for i in range(len(lines)):
-            rows.append(shred_condition_fast(lines[i]))
+        for i in range(len(spans)):
+            var span = spans[i]
+            rows.append(shred_condition_fast(b[span[0] : span[1]]))
         conditions_to_feather(rows, out_path)
     else:
         raise Error(

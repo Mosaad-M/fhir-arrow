@@ -350,13 +350,14 @@ def _coding0_at(b: Span[UInt8, _], code_start: Int) raises -> Optional[Int]:
 # ── Patient ──────────────────────────────────────────────────────────────────
 
 
-def shred_patient_fast(line: String) raises -> PatientRow:
+def shred_patient_fast(b: Span[UInt8, _]) raises -> PatientRow:
     """Zero-tree equivalent of resources.mojo's shred_patient: same v0
     field scope, same behavior on missing/optional fields. Resolves all
     five top-level fields in a single pass over the object via _find_keys,
-    instead of one full re-scan per field."""
-    var b = line.as_bytes()
-
+    instead of one full re-scan per field. Takes the record's raw bytes
+    directly (a slice of the whole NDJSON file's buffer) rather than an
+    owned line String, so reading a large file no longer costs one String
+    allocation per line just to hand it to the shredder."""
     var top_keys: List[String] = ["id", "gender", "birthDate", "name", "deceasedBoolean"]
     var top = _find_keys(b, 0, top_keys)
 
@@ -396,12 +397,11 @@ def shred_patient_fast(line: String) raises -> PatientRow:
 # ── Observation ──────────────────────────────────────────────────────────────
 
 
-def shred_observation_fast(line: String) raises -> ObservationRow:
+def shred_observation_fast(b: Span[UInt8, _]) raises -> ObservationRow:
     """Zero-tree equivalent of resources.mojo's shred_observation. Resolves
     all seven top-level fields in a single pass via _find_keys, instead of
-    six separate full re-scans of the same object."""
-    var b = line.as_bytes()
-
+    six separate full re-scans of the same object. Takes the record's raw
+    bytes directly, see shred_patient_fast."""
     var top_keys: List[String] = [
         "id", "subject", "code", "status", "effectiveDateTime",
         "valueQuantity", "valueString",
@@ -471,12 +471,11 @@ def shred_observation_fast(line: String) raises -> ObservationRow:
 # ── Condition ────────────────────────────────────────────────────────────────
 
 
-def shred_condition_fast(line: String) raises -> ConditionRow:
+def shred_condition_fast(b: Span[UInt8, _]) raises -> ConditionRow:
     """Zero-tree equivalent of resources.mojo's shred_condition. Resolves
     all six top-level fields in a single pass via _find_keys, instead of
-    six separate full re-scans of the same object."""
-    var b = line.as_bytes()
-
+    six separate full re-scans of the same object. Takes the record's raw
+    bytes directly, see shred_patient_fast."""
     var top_keys: List[String] = [
         "id", "subject", "code", "clinicalStatus", "onsetDateTime", "recordedDate",
     ]

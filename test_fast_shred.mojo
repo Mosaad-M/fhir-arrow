@@ -290,7 +290,7 @@ def test_shred_patient_fast_minimal() raises:
         '{"resourceType": "Patient", "id": "p1", "gender": "female",'
         ' "birthDate": "1990-01-01"}'
     )
-    var row = shred_patient_fast(line)
+    var row = shred_patient_fast(line.as_bytes())
     assert_eq_str(row.id, "p1", "id")
     assert_true(row.gender.value() == "female", "gender")
     assert_true(row.birth_date.value() == "1990-01-01", "birth_date")
@@ -303,14 +303,14 @@ def test_shred_patient_fast_with_name() raises:
     var line = String(
         '{"id": "p2", "name": [{"family": "Smith", "given": ["Jane", "Q"]}]}'
     )
-    var row = shred_patient_fast(line)
+    var row = shred_patient_fast(line.as_bytes())
     assert_true(row.family_name.value() == "Smith", "family_name")
     assert_true(row.given_name.value() == "Jane", "given_name (first only)")
 
 
 def test_shred_patient_fast_deceased_boolean() raises:
     var line = String('{"id": "p3", "deceasedBoolean": true}')
-    var row = shred_patient_fast(line)
+    var row = shred_patient_fast(line.as_bytes())
     assert_true(row.deceased.value() == True, "deceased true")
 
 
@@ -318,7 +318,7 @@ def test_shred_patient_fast_missing_id_raises() raises:
     var line = String('{"gender": "male"}')
     var raised = False
     try:
-        _ = shred_patient_fast(line)
+        _ = shred_patient_fast(line.as_bytes())
     except:
         raised = True
     assert_true(raised, "missing id should raise")
@@ -333,7 +333,7 @@ def test_shred_observation_fast_value_quantity() raises:
         ' "effectiveDateTime": "2024-01-01T00:00:00Z",'
         ' "valueQuantity": {"value": 5.4, "unit": "%"}}'
     )
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_eq_str(row.id, "o1", "id")
     assert_eq_str(row.patient_ref.value(), "Patient/p1", "patient_ref")
     assert_eq_str(row.code.value(), "4548-4", "code")
@@ -355,7 +355,7 @@ def test_shred_observation_fast_value_string() raises:
         '{"id": "o2", "code": {"coding": [{"code": "obs-note"}]},'
         ' "valueString": "no acute findings"}'
     )
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_eq_str(row.value_string.value(), "no acute findings", "value_string")
     assert_true(not row.value_quantity, "value_quantity should be null")
     assert_true(not row.value_unit, "value_unit should be null")
@@ -363,7 +363,7 @@ def test_shred_observation_fast_value_string() raises:
 
 def test_shred_observation_fast_no_value() raises:
     var line = String('{"id": "o3", "code": {"coding": [{"code": "x"}]}}')
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_true(not row.value_quantity, "value_quantity should be null")
     assert_true(not row.value_string, "value_string should be null")
 
@@ -372,7 +372,7 @@ def test_shred_observation_fast_missing_id_raises() raises:
     var line = String('{"status": "final"}')
     var raised = False
     try:
-        _ = shred_observation_fast(line)
+        _ = shred_observation_fast(line.as_bytes())
     except:
         raised = True
     assert_true(raised, "missing id should raise")
@@ -386,7 +386,7 @@ def test_shred_condition_fast_full() raises:
         ' "onsetDateTime": "2020-05-01",'
         ' "recordedDate": "2020-05-02"}'
     )
-    var row = shred_condition_fast(line)
+    var row = shred_condition_fast(line.as_bytes())
     assert_eq_str(row.id, "c1", "id")
     assert_eq_str(row.patient_ref.value(), "Patient/p1", "patient_ref")
     assert_eq_str(row.code.value(), "44054006", "code")
@@ -398,7 +398,7 @@ def test_shred_condition_fast_full() raises:
 
 def test_shred_condition_fast_no_onset() raises:
     var line = String('{"id": "c2", "code": {"coding": [{"code": "x"}]}}')
-    var row = shred_condition_fast(line)
+    var row = shred_condition_fast(line.as_bytes())
     assert_true(not row.onset_datetime, "onset_datetime should be null")
 
 
@@ -406,7 +406,7 @@ def test_shred_condition_fast_missing_id_raises() raises:
     var line = String('{"code": {"coding": [{"code": "x"}]}}')
     var raised = False
     try:
-        _ = shred_condition_fast(line)
+        _ = shred_condition_fast(line.as_bytes())
     except:
         raised = True
     assert_true(raised, "missing id should raise")
@@ -424,7 +424,7 @@ def test_shred_observation_fast_note_with_escaped_structural_chars() raises:
         '{"id": "o4", "note": "patient said \\"ok\\", {no code} [fine]",'
         ' "status": "final", "code": {"coding": [{"code": "9279-1"}]}}'
     )
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_eq_str(row.id, "o4", "id")
     assert_eq_str(row.status.value(), "final", "status survives the adversarial note field")
     assert_eq_str(row.code.value(), "9279-1", "code survives the adversarial note field")
@@ -438,7 +438,7 @@ def test_shred_observation_fast_code_key_collision() raises:
         '{"id": "o5", "code": {"coding": [{"system": "http://loinc.org",'
         ' "code": "4548-4", "display": "Hemoglobin A1c"}]}}'
     )
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_eq_str(row.code.value(), "4548-4", "should read coding[0].code, not confuse the outer object")
 
 
@@ -459,7 +459,7 @@ def test_shred_observation_fast_out_of_order_with_unknown_fields() raises:
         ' "valueQuantity": {"value": 170.0, "unit": "cm", "system": "http://unitsofmeasure.org"},'
         ' "id": "o6"}'
     )
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_eq_str(row.id, "o6", "id found despite appearing last")
     assert_eq_str(row.code.value(), "8302-2", "code found past the unrelated category coding array")
     assert_eq_str(row.patient_ref.value(), "Patient/p1", "patient_ref")
@@ -475,7 +475,7 @@ def test_shred_observation_fast_multiple_coding_entries() raises:
         '{"system": "http://snomed.info/sct", "code": "SECOND", "display": "Second Code"}'
         ']}}'
     )
-    var row = shred_observation_fast(line)
+    var row = shred_observation_fast(line.as_bytes())
     assert_eq_str(row.code.value(), "FIRST", "only the first coding entry should be read")
     assert_eq_str(row.code_display.value(), "First Code", "only the first coding entry should be read")
 
@@ -488,7 +488,7 @@ def test_shred_condition_fast_unicode_escape_in_skipped_field() raises:
         ' "code": {"coding": [{"code": "44054006", "display": "Diabetes"}]},'
         ' "onsetDateTime": "2020-05-01"}'
     )
-    var row = shred_condition_fast(line)
+    var row = shred_condition_fast(line.as_bytes())
     assert_eq_str(row.id, "c3", "id")
     assert_eq_str(row.code.value(), "44054006", "code survives the unicode escape in note")
     assert_eq_str(row.onset_datetime.value(), "2020-05-01", "onset_datetime survives the unicode escape in note")
