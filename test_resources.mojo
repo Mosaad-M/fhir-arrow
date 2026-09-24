@@ -1,4 +1,8 @@
-from resources import PatientRow, shred_patient, ObservationRow, shred_observation
+from resources import (
+    PatientRow, shred_patient,
+    ObservationRow, shred_observation,
+    ConditionRow, shred_condition,
+)
 from json import parse_json
 
 
@@ -129,6 +133,48 @@ def test_shred_observation_missing_id_raises() raises:
     assert_true(raised, "missing id should raise")
 
 
+# ── Condition ────────────────────────────────────────────────────────────────
+
+
+def test_shred_condition_full() raises:
+    """onsetDateTime and clinicalStatus.coding[0].code are extracted when present."""
+    var obj = parse_json(
+        '{"id": "c1", "subject": {"reference": "Patient/p1"},'
+        ' "code": {"coding": [{"code": "44054006", "display": "Diabetes"}]},'
+        ' "clinicalStatus": {"coding": [{"code": "active"}]},'
+        ' "onsetDateTime": "2020-05-01",'
+        ' "recordedDate": "2020-05-02"}'
+    )
+    var row = shred_condition(obj)
+    assert_eq_str(row.id, "c1", "id")
+    assert_eq_str(row.patient_ref.value(), "Patient/p1", "patient_ref")
+    assert_eq_str(row.code.value(), "44054006", "code")
+    assert_eq_str(row.code_display.value(), "Diabetes", "code_display")
+    assert_eq_str(row.clinical_status.value(), "active", "clinical_status")
+    assert_eq_str(row.onset_datetime.value(), "2020-05-01", "onset_datetime")
+    assert_eq_str(row.recorded_date.value(), "2020-05-02", "recorded_date")
+
+
+def test_shred_condition_no_onset() raises:
+    """A Condition with no onsetDateTime shreds cleanly, onset_datetime null."""
+    var obj = parse_json(
+        '{"id": "c2", "code": {"coding": [{"code": "x"}]}}'
+    )
+    var row = shred_condition(obj)
+    assert_true(not row.onset_datetime, "onset_datetime should be null")
+
+
+def test_shred_condition_missing_id_raises() raises:
+    """id is required for Condition too."""
+    var obj = parse_json('{"code": {"coding": [{"code": "x"}]}}')
+    var raised = False
+    try:
+        _ = shred_condition(obj)
+    except:
+        raised = True
+    assert_true(raised, "missing id should raise")
+
+
 def main() raises:
     test_shred_patient_minimal()
     print("PASS test_shred_patient_minimal")
@@ -153,5 +199,14 @@ def main() raises:
 
     test_shred_observation_missing_id_raises()
     print("PASS test_shred_observation_missing_id_raises")
+
+    test_shred_condition_full()
+    print("PASS test_shred_condition_full")
+
+    test_shred_condition_no_onset()
+    print("PASS test_shred_condition_no_onset")
+
+    test_shred_condition_missing_id_raises()
+    print("PASS test_shred_condition_missing_id_raises")
 
     print("\nAll resource tests passed.")

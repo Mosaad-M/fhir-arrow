@@ -221,3 +221,100 @@ def shred_observation(obj: JsonValue) raises -> ObservationRow:
         value_unit,
         value_string,
     )
+
+
+# ── Condition ────────────────────────────────────────────────────────────────
+
+
+struct ConditionRow(Copyable, Movable):
+    var id: String
+    var patient_ref: Optional[String]
+    var code: Optional[String]
+    var code_display: Optional[String]
+    var clinical_status: Optional[String]
+    var onset_datetime: Optional[String]
+    var recorded_date: Optional[String]
+
+    def __init__(
+        out self,
+        id: String,
+        patient_ref: Optional[String],
+        code: Optional[String],
+        code_display: Optional[String],
+        clinical_status: Optional[String],
+        onset_datetime: Optional[String],
+        recorded_date: Optional[String],
+    ):
+        self.id = id
+        self.patient_ref = patient_ref
+        self.code = code
+        self.code_display = code_display
+        self.clinical_status = clinical_status
+        self.onset_datetime = onset_datetime
+        self.recorded_date = recorded_date
+
+    def __init__(out self, *, copy: Self):
+        self.id = copy.id
+        self.patient_ref = copy.patient_ref
+        self.code = copy.code
+        self.code_display = copy.code_display
+        self.clinical_status = copy.clinical_status
+        self.onset_datetime = copy.onset_datetime
+        self.recorded_date = copy.recorded_date
+
+    def __init__(out self, *, deinit move: Self):
+        self.id = move.id^
+        self.patient_ref = move.patient_ref^
+        self.code = move.code^
+        self.code_display = move.code_display^
+        self.clinical_status = move.clinical_status^
+        self.onset_datetime = move.onset_datetime^
+        self.recorded_date = move.recorded_date^
+
+
+def shred_condition(obj: JsonValue) raises -> ConditionRow:
+    """Flatten a FHIR Condition resource into a ConditionRow.
+
+    v0 scope: id, subject.reference, code.coding[0] (code/display),
+    clinicalStatus.coding[0].code, onsetDateTime, recordedDate. Other
+    onset[x] variants (e.g. onsetAge, onsetPeriod) are out of scope and
+    left null.
+    """
+    if not obj.has_key("id"):
+        raise Error("resources: shred_condition: missing required field 'id'")
+    var id = obj.get_string("id")
+
+    var patient_ref = Optional[String](None)
+    if obj.has_key("subject") and obj.get("subject").has_key("reference"):
+        patient_ref = Optional[String](obj.get("subject").get_string("reference"))
+
+    var code = Optional[String](None)
+    var code_display = Optional[String](None)
+    var coding0 = _coding0(obj)
+    if coding0:
+        var c0 = coding0.value().copy()
+        if c0.has_key("code"):
+            code = Optional[String](c0.get_string("code"))
+        if c0.has_key("display"):
+            code_display = Optional[String](c0.get_string("display"))
+
+    var clinical_status = Optional[String](None)
+    if obj.has_key("clinicalStatus"):
+        var cs = obj.get("clinicalStatus")
+        if cs.has_key("coding") and cs.get_array_len("coding") > 0:
+            var cs0 = cs.get("coding").get(0)
+            if cs0.has_key("code"):
+                clinical_status = Optional[String](cs0.get_string("code"))
+
+    var onset_datetime = _opt_string(obj, "onsetDateTime")
+    var recorded_date = _opt_string(obj, "recordedDate")
+
+    return ConditionRow(
+        id,
+        patient_ref,
+        code,
+        code_display,
+        clinical_status,
+        onset_datetime,
+        recorded_date,
+    )
