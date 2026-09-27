@@ -171,7 +171,13 @@ def patient_schema() -> ArrowSchema:
     return ArrowSchema(fields, Int16(0))
 
 
-def patients_to_record_batch(rows: List[PatientRow]) raises -> RecordBatch:
+def patients_to_record_batch(var rows: List[PatientRow]) raises -> RecordBatch:
+    """Consumes `rows`: moves each field out via into_parts() instead of
+    copying it out of a borrowed reference, since every field was already
+    allocated once during shredding -- a second copy here would double
+    the allocation cost for no reason. `.pop()` consumes from the back,
+    so columns are built in reverse row order and then reversed once
+    each before use (single O(n) pass per column, not per-element)."""
     var n = len(rows)
     var ids = List[String](capacity=n)
     var genders = List[Optional[String]](capacity=n)
@@ -179,13 +185,21 @@ def patients_to_record_batch(rows: List[PatientRow]) raises -> RecordBatch:
     var family_names = List[Optional[String]](capacity=n)
     var given_names = List[Optional[String]](capacity=n)
     var deceased = List[Optional[Bool]](capacity=n)
-    for i in range(len(rows)):
-        ids.append(rows[i].id)
-        genders.append(rows[i].gender)
-        birth_dates.append(rows[i].birth_date)
-        family_names.append(rows[i].family_name)
-        given_names.append(rows[i].given_name)
-        deceased.append(rows[i].deceased)
+    while len(rows) > 0:
+        var row = rows.pop()
+        var parts = row^.into_parts()
+        ids.append(parts[0])
+        genders.append(parts[1])
+        birth_dates.append(parts[2])
+        family_names.append(parts[3])
+        given_names.append(parts[4])
+        deceased.append(parts[5])
+    ids.reverse()
+    genders.reverse()
+    birth_dates.reverse()
+    family_names.reverse()
+    given_names.reverse()
+    deceased.reverse()
 
     var arrays = List[ArrowArray]()
     arrays.append(build_required_string_column(ids))
@@ -194,12 +208,12 @@ def patients_to_record_batch(rows: List[PatientRow]) raises -> RecordBatch:
     arrays.append(build_string_column(family_names))
     arrays.append(build_string_column(given_names))
     arrays.append(build_bool_column(deceased))
-    return RecordBatch(Int64(len(rows)), arrays)
+    return RecordBatch(Int64(n), arrays)
 
 
-def patients_to_feather(rows: List[PatientRow], path: String) raises:
+def patients_to_feather(var rows: List[PatientRow], path: String) raises:
     var schema = patient_schema()
-    var batch = patients_to_record_batch(rows)
+    var batch = patients_to_record_batch(rows^)
     var batches = List[RecordBatch]()
     batches.append(batch^)
     var file_bytes = encode_arrow_file(schema, batches)
@@ -224,7 +238,9 @@ def observation_schema() -> ArrowSchema:
     return ArrowSchema(fields, Int16(0))
 
 
-def observations_to_record_batch(rows: List[ObservationRow]) raises -> RecordBatch:
+def observations_to_record_batch(var rows: List[ObservationRow]) raises -> RecordBatch:
+    """Consumes `rows` -- see patients_to_record_batch for why (avoids a
+    second copy of every already-allocated field)."""
     var n = len(rows)
     var ids = List[String](capacity=n)
     var patient_refs = List[Optional[String]](capacity=n)
@@ -236,17 +252,29 @@ def observations_to_record_batch(rows: List[ObservationRow]) raises -> RecordBat
     var value_quantities = List[Optional[Float64]](capacity=n)
     var value_units = List[Optional[String]](capacity=n)
     var value_strings = List[Optional[String]](capacity=n)
-    for i in range(len(rows)):
-        ids.append(rows[i].id)
-        patient_refs.append(rows[i].patient_ref)
-        codes.append(rows[i].code)
-        code_systems.append(rows[i].code_system)
-        code_displays.append(rows[i].code_display)
-        statuses.append(rows[i].status)
-        effective_datetimes.append(rows[i].effective_datetime)
-        value_quantities.append(rows[i].value_quantity)
-        value_units.append(rows[i].value_unit)
-        value_strings.append(rows[i].value_string)
+    while len(rows) > 0:
+        var row = rows.pop()
+        var parts = row^.into_parts()
+        ids.append(parts[0])
+        patient_refs.append(parts[1])
+        codes.append(parts[2])
+        code_systems.append(parts[3])
+        code_displays.append(parts[4])
+        statuses.append(parts[5])
+        effective_datetimes.append(parts[6])
+        value_quantities.append(parts[7])
+        value_units.append(parts[8])
+        value_strings.append(parts[9])
+    ids.reverse()
+    patient_refs.reverse()
+    codes.reverse()
+    code_systems.reverse()
+    code_displays.reverse()
+    statuses.reverse()
+    effective_datetimes.reverse()
+    value_quantities.reverse()
+    value_units.reverse()
+    value_strings.reverse()
 
     var arrays = List[ArrowArray]()
     arrays.append(build_required_string_column(ids))
@@ -259,12 +287,12 @@ def observations_to_record_batch(rows: List[ObservationRow]) raises -> RecordBat
     arrays.append(build_float64_column(value_quantities))
     arrays.append(build_string_column(value_units))
     arrays.append(build_string_column(value_strings))
-    return RecordBatch(Int64(len(rows)), arrays)
+    return RecordBatch(Int64(n), arrays)
 
 
-def observations_to_feather(rows: List[ObservationRow], path: String) raises:
+def observations_to_feather(var rows: List[ObservationRow], path: String) raises:
     var schema = observation_schema()
-    var batch = observations_to_record_batch(rows)
+    var batch = observations_to_record_batch(rows^)
     var batches = List[RecordBatch]()
     batches.append(batch^)
     var file_bytes = encode_arrow_file(schema, batches)
@@ -286,7 +314,9 @@ def condition_schema() -> ArrowSchema:
     return ArrowSchema(fields, Int16(0))
 
 
-def conditions_to_record_batch(rows: List[ConditionRow]) raises -> RecordBatch:
+def conditions_to_record_batch(var rows: List[ConditionRow]) raises -> RecordBatch:
+    """Consumes `rows` -- see patients_to_record_batch for why (avoids a
+    second copy of every already-allocated field)."""
     var n = len(rows)
     var ids = List[String](capacity=n)
     var patient_refs = List[Optional[String]](capacity=n)
@@ -295,14 +325,23 @@ def conditions_to_record_batch(rows: List[ConditionRow]) raises -> RecordBatch:
     var clinical_statuses = List[Optional[String]](capacity=n)
     var onset_datetimes = List[Optional[String]](capacity=n)
     var recorded_dates = List[Optional[String]](capacity=n)
-    for i in range(len(rows)):
-        ids.append(rows[i].id)
-        patient_refs.append(rows[i].patient_ref)
-        codes.append(rows[i].code)
-        code_displays.append(rows[i].code_display)
-        clinical_statuses.append(rows[i].clinical_status)
-        onset_datetimes.append(rows[i].onset_datetime)
-        recorded_dates.append(rows[i].recorded_date)
+    while len(rows) > 0:
+        var row = rows.pop()
+        var parts = row^.into_parts()
+        ids.append(parts[0])
+        patient_refs.append(parts[1])
+        codes.append(parts[2])
+        code_displays.append(parts[3])
+        clinical_statuses.append(parts[4])
+        onset_datetimes.append(parts[5])
+        recorded_dates.append(parts[6])
+    ids.reverse()
+    patient_refs.reverse()
+    codes.reverse()
+    code_displays.reverse()
+    clinical_statuses.reverse()
+    onset_datetimes.reverse()
+    recorded_dates.reverse()
 
     var arrays = List[ArrowArray]()
     arrays.append(build_required_string_column(ids))
@@ -312,12 +351,12 @@ def conditions_to_record_batch(rows: List[ConditionRow]) raises -> RecordBatch:
     arrays.append(build_string_column(clinical_statuses))
     arrays.append(build_string_column(onset_datetimes))
     arrays.append(build_string_column(recorded_dates))
-    return RecordBatch(Int64(len(rows)), arrays)
+    return RecordBatch(Int64(n), arrays)
 
 
-def conditions_to_feather(rows: List[ConditionRow], path: String) raises:
+def conditions_to_feather(var rows: List[ConditionRow], path: String) raises:
     var schema = condition_schema()
-    var batch = conditions_to_record_batch(rows)
+    var batch = conditions_to_record_batch(rows^)
     var batches = List[RecordBatch]()
     batches.append(batch^)
     var file_bytes = encode_arrow_file(schema, batches)
@@ -345,19 +384,19 @@ def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raise
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_patient_fast(b[span[0] : span[1]]))
-        patients_to_feather(rows, out_path)
+        patients_to_feather(rows^, out_path)
     elif kind == "Observation":
         var rows = List[ObservationRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_observation_fast(b[span[0] : span[1]]))
-        observations_to_feather(rows, out_path)
+        observations_to_feather(rows^, out_path)
     elif kind == "Condition":
         var rows = List[ConditionRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_condition_fast(b[span[0] : span[1]]))
-        conditions_to_feather(rows, out_path)
+        conditions_to_feather(rows^, out_path)
     else:
         raise Error(
             "fhir_arrow: ndjson_to_feather: unknown resource kind '"
@@ -394,19 +433,19 @@ def ndjson_range_to_feather(
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_patient_fast(b[span[0] : span[1]]))
-        patients_to_feather(rows, out_path)
+        patients_to_feather(rows^, out_path)
     elif kind == "Observation":
         var rows = List[ObservationRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_observation_fast(b[span[0] : span[1]]))
-        observations_to_feather(rows, out_path)
+        observations_to_feather(rows^, out_path)
     elif kind == "Condition":
         var rows = List[ConditionRow](capacity=len(spans))
         for i in range(len(spans)):
             var span = spans[i]
             rows.append(shred_condition_fast(b[span[0] : span[1]]))
-        conditions_to_feather(rows, out_path)
+        conditions_to_feather(rows^, out_path)
     else:
         raise Error(
             "fhir_arrow: ndjson_range_to_feather: unknown resource kind '"

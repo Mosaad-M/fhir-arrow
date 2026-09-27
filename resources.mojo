@@ -52,6 +52,37 @@ struct PatientRow(Copyable, Movable):
         self.given_name = move.given_name^
         self.deceased = move.deceased^
 
+    def into_parts(
+        deinit self,
+    ) -> Tuple[
+        String,
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[Bool],
+    ]:
+        """Move every field out of self in one shot (a struct method is
+        required for `deinit self` -- a free-function equivalent doesn't
+        work). Used by the row-to-column transpose in fhir_arrow.mojo to
+        avoid a second copy of every field on top of the one already paid
+        during shredding."""
+        return Tuple[
+            String,
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[Bool],
+        ](
+            self.id^,
+            self.gender^,
+            self.birth_date^,
+            self.family_name^,
+            self.given_name^,
+            self.deceased^,
+        )
+
 
 # ── Observation ──────────────────────────────────────────────────────────────
 
@@ -116,6 +147,46 @@ struct ObservationRow(Copyable, Movable):
         self.value_unit = move.value_unit^
         self.value_string = move.value_string^
 
+    def into_parts(
+        deinit self,
+    ) -> Tuple[
+        String,
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[Float64],
+        Optional[String],
+        Optional[String],
+    ]:
+        """Move every field out of self in one shot (see PatientRow.into_parts
+        for why this needs to be a struct method, not a free function)."""
+        return Tuple[
+            String,
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[Float64],
+            Optional[String],
+            Optional[String],
+        ](
+            self.id^,
+            self.patient_ref^,
+            self.code^,
+            self.code_system^,
+            self.code_display^,
+            self.status^,
+            self.effective_datetime^,
+            self.value_quantity^,
+            self.value_unit^,
+            self.value_string^,
+        )
+
 
 # ── Condition ────────────────────────────────────────────────────────────────
 
@@ -164,3 +235,34 @@ struct ConditionRow(Copyable, Movable):
         self.clinical_status = move.clinical_status^
         self.onset_datetime = move.onset_datetime^
         self.recorded_date = move.recorded_date^
+
+    def into_parts(
+        deinit self,
+    ) -> Tuple[
+        String,
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+        Optional[String],
+    ]:
+        """Move every field out of self in one shot (see PatientRow.into_parts
+        for why this needs to be a struct method, not a free function)."""
+        return Tuple[
+            String,
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+            Optional[String],
+        ](
+            self.id^,
+            self.patient_ref^,
+            self.code^,
+            self.code_display^,
+            self.clinical_status^,
+            self.onset_datetime^,
+            self.recorded_date^,
+        )

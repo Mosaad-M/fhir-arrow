@@ -2,7 +2,10 @@ from fhir_arrow import (
     build_string_column, build_required_string_column,
     build_float64_column, build_bool_column,
     ndjson_to_feather, ndjson_range_to_feather, merge_feathers,
+    patients_to_record_batch, observations_to_record_batch,
+    conditions_to_record_batch,
 )
+from resources import PatientRow, ObservationRow, ConditionRow
 from arrow import (
     ArrowType, ArrowField, ArrowSchema, ArrowArray, RecordBatch,
     encode_arrow_file, decode_arrow_file,
@@ -263,6 +266,68 @@ def test_merge_feathers_combines_in_order() raises:
     assert_eq_str(_get_utf8(id_col1, 0), "p3", "merged batch1 row0 id")
 
 
+def test_patients_to_record_batch_preserves_row_order() raises:
+    """Regression test for the row-to-column transpose rewrite:
+    patients_to_record_batch now consumes `rows` via `.pop()` (which
+    consumes from the back) + `.into_parts()` instead of copying each
+    field out of a borrowed reference. Every output column list must be
+    `.reverse()`d back to original order before use -- this test exists
+    specifically to catch a missing/wrong reverse() call, which would
+    silently emit every column in reverse-of-input-file order."""
+    var rows = List[PatientRow]()
+    rows.append(PatientRow("p1", Optional[String]("female"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Bool](None)))
+    rows.append(PatientRow("p2", Optional[String]("male"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Bool](None)))
+    rows.append(PatientRow("p3", Optional[String]("female"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Bool](None)))
+
+    var batch = patients_to_record_batch(rows^)
+    assert_eq_int(Int(batch.length), 3, "row count")
+    var id_col = batch.columns[0].copy()
+    var gender_col = batch.columns[1].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "p1", "row 0 id in original order")
+    assert_eq_str(_get_utf8(id_col, 1), "p2", "row 1 id in original order")
+    assert_eq_str(_get_utf8(id_col, 2), "p3", "row 2 id in original order")
+    assert_eq_str(_get_utf8(gender_col, 0), "female", "row 0 gender matches row 0 id (columns stay aligned)")
+    assert_eq_str(_get_utf8(gender_col, 1), "male", "row 1 gender matches row 1 id (columns stay aligned)")
+
+
+def test_observations_to_record_batch_preserves_row_order() raises:
+    """Same regression coverage as the Patient version, for
+    observations_to_record_batch."""
+    var rows = List[ObservationRow]()
+    rows.append(ObservationRow("o1", Optional[String](None), Optional[String]("code-a"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Float64](None), Optional[String](None), Optional[String](None)))
+    rows.append(ObservationRow("o2", Optional[String](None), Optional[String]("code-b"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Float64](None), Optional[String](None), Optional[String](None)))
+    rows.append(ObservationRow("o3", Optional[String](None), Optional[String]("code-c"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Float64](None), Optional[String](None), Optional[String](None)))
+
+    var batch = observations_to_record_batch(rows^)
+    assert_eq_int(Int(batch.length), 3, "row count")
+    var id_col = batch.columns[0].copy()
+    var code_col = batch.columns[2].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "o1", "row 0 id in original order")
+    assert_eq_str(_get_utf8(id_col, 1), "o2", "row 1 id in original order")
+    assert_eq_str(_get_utf8(id_col, 2), "o3", "row 2 id in original order")
+    assert_eq_str(_get_utf8(code_col, 0), "code-a", "row 0 code matches row 0 id (columns stay aligned)")
+    assert_eq_str(_get_utf8(code_col, 2), "code-c", "row 2 code matches row 2 id (columns stay aligned)")
+
+
+def test_conditions_to_record_batch_preserves_row_order() raises:
+    """Same regression coverage as the Patient version, for
+    conditions_to_record_batch."""
+    var rows = List[ConditionRow]()
+    rows.append(ConditionRow("c1", Optional[String](None), Optional[String]("code-x"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None)))
+    rows.append(ConditionRow("c2", Optional[String](None), Optional[String]("code-y"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None)))
+    rows.append(ConditionRow("c3", Optional[String](None), Optional[String]("code-z"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None)))
+
+    var batch = conditions_to_record_batch(rows^)
+    assert_eq_int(Int(batch.length), 3, "row count")
+    var id_col = batch.columns[0].copy()
+    var code_col = batch.columns[2].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "c1", "row 0 id in original order")
+    assert_eq_str(_get_utf8(id_col, 1), "c2", "row 1 id in original order")
+    assert_eq_str(_get_utf8(id_col, 2), "c3", "row 2 id in original order")
+    assert_eq_str(_get_utf8(code_col, 0), "code-x", "row 0 code matches row 0 id (columns stay aligned)")
+    assert_eq_str(_get_utf8(code_col, 2), "code-z", "row 2 code matches row 2 id (columns stay aligned)")
+
+
 def test_parallel_chunked_equivalent_to_sequential() raises:
     """The explicit equivalence check the v2 performance-roadmap plan requires:
     chunk+merge (the parallel path's building blocks) must produce identical
@@ -372,6 +437,15 @@ def main() raises:
 
     test_merge_feathers_combines_in_order()
     print("PASS test_merge_feathers_combines_in_order")
+
+    test_patients_to_record_batch_preserves_row_order()
+    print("PASS test_patients_to_record_batch_preserves_row_order")
+
+    test_observations_to_record_batch_preserves_row_order()
+    print("PASS test_observations_to_record_batch_preserves_row_order")
+
+    test_conditions_to_record_batch_preserves_row_order()
+    print("PASS test_conditions_to_record_batch_preserves_row_order")
 
     test_parallel_chunked_equivalent_to_sequential()
     print("PASS test_parallel_chunked_equivalent_to_sequential")

@@ -536,6 +536,64 @@ something that didn't pan out. All 61 `fast_shred.mojo` tests pass
 investigation surfaced), full suite and real `pyarrow` interop
 re-verified unchanged.
 
+### Phase G: eliminate the row-to-column transpose copy, guided by a real profiler
+
+Instead of guessing at the next bottleneck, this phase started with a real
+macOS `sample`-based profiling pass (debug-symbol binary, 23.7s of actual
+execution, ~110K stack samples, idle background threads correctly
+excluded from the analysis). Real breakdown of actual work time: **JSON
+scanning 36.2%, allocator (tcmalloc) overhead 24.0%, Arrow encoding
+13.3%, column building 8.3%**, the rest smaller. The allocator bucket had
+never been targeted and was bigger than Arrow encoding and column
+building combined.
+
+Reading the code (not guessing) found a precise, narrow cause: every
+extracted field string was allocated *twice* — once during shredding
+(`_extract_string`, unavoidable), and a second time during the
+row-to-column transpose in `fhir_arrow.mojo` (`ids.append(rows[i].id)` —
+an implicit copy out of a borrowed row reference). Fixed by making
+`patients_to_record_batch`/`observations_to_record_batch`/
+`conditions_to_record_batch` consume `rows` (`var rows: List[XRow]`
+instead of borrowed) and adding an `into_parts(deinit self) -> Tuple[...]`
+method to each row struct that moves every field out in one shot — a
+struct method is required here; `deinit` as a parameter convention only
+works on struct methods, confirmed by the compiler rejecting a
+free-function attempt. `.pop()` (used for consuming iteration) consumes
+from the back, so each output column list is built in reverse row order
+and `.reverse()`d once before use — a new dedicated test per resource
+type (`test_*_to_record_batch_preserves_row_order`) exists specifically
+to catch a missing/wrong `.reverse()` call, and was confirmed to actually
+catch it: temporarily deleting one `.reverse()` call made the test fail
+with the exact wrong row order, restoring it made it pass again.
+
+**Real numbers**, same data: Patient 4.833→4.887 ms (flat — expected,
+allocator savings on 577 rows are small in absolute terms), Observation
+1670.8→1659.6 ms (0.7% faster), Condition 111.8→106.3 ms (5.0% faster).
+
+**Honest finding, from a second profiling pass after the fix, not just
+"tests still pass"**: the allocator-overhead bucket **did not shrink**
+(24.0% → 24.5%, unchanged within noise), even though the fix is correct,
+tested, and gives a real small win. The likely explanation: Mojo's
+`String` probably has small-string optimization, and most FHIR field
+values (ids, codes, short dates) are short enough to never have touched
+the heap on the transpose copy in the first place — so removing that
+copy saved real, measurable CPU work (struct/pointer bookkeeping), just
+not the malloc/free churn the original hypothesis assumed. The true
+source of the 24% allocator bucket is most likely the *original*
+`_extract_string` calls during shredding (deliberately left untouched by
+this phase's narrow scope), or the parallel path's own resources, not
+the transpose step. **Lesson carried forward from Phase F, reinforced
+here**: a real profiler tells you *where* time goes; it doesn't tell you
+*why* a specific line is expensive, and a plausible mechanism (like "this
+copy must be a malloc") still needs to be checked against a second
+profiling pass, not assumed correct just because the fix compiled and
+the wall-clock number moved in the right direction.
+
+Verified for real, not just via the fixture-scale unit tests: generated a
+real `patients.feather` from all 577 Synthea Patient records and compared
+every `id` value, in order, directly against the source NDJSON file — an
+exact match, not just "577 rows came back."
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
