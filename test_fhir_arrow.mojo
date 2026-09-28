@@ -1,13 +1,10 @@
 from fhir_arrow import (
-    build_string_column, build_required_string_column,
-    build_float64_column, build_bool_column,
     ndjson_to_feather, ndjson_range_to_feather, merge_feathers,
-    patients_to_record_batch, observations_to_record_batch,
-    conditions_to_record_batch,
     PatientColumns, shred_patient_fast_into_columns,
+    ObservationColumns, shred_observation_fast_into_columns,
+    ConditionColumns, shred_condition_fast_into_columns,
+    StringColumnBuilder, BoolColumnBuilder, Float64ColumnBuilder,
 )
-from resources import PatientRow, ObservationRow, ConditionRow
-from fast_shred import shred_patient_fast
 from arrow import (
     ArrowType, ArrowField, ArrowSchema, ArrowArray, RecordBatch,
     encode_arrow_file, decode_arrow_file,
@@ -73,17 +70,20 @@ def _get_bool(col: ArrowArray, row: Int) -> Bool:
     return ((col.values[byte_idx] >> UInt8(bit_idx)) & UInt8(1)) != UInt8(0)
 
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
+# ── Streaming column builders: direct roundtrip through a real Feather file ──
 
 
 def test_string_column_roundtrip_with_null() raises:
-    """A 3-row Utf8 column with a null in the middle roundtrips through a real Feather file."""
-    var values = List[Optional[String]]()
-    values.append(Optional[String]("alice"))
-    values.append(Optional[String](None))
-    values.append(Optional[String]("carol"))
-
-    var arr = build_string_column(values)
+    """A 3-row Utf8 column with a null in the middle roundtrips through a
+    real Feather file. append_json_string is fed small JSON string
+    literals, the same shape it consumes in production."""
+    var builder = StringColumnBuilder()
+    var s0 = String('"alice"')
+    builder.append_json_string(s0.as_bytes(), 0)
+    builder.append_null()
+    var s2 = String('"carol"')
+    builder.append_json_string(s2.as_bytes(), 0)
+    var arr = builder^.finish()
     assert_eq_int(arr.null_count, 1, "null_count")
 
     var fields = List[ArrowField]()
@@ -112,13 +112,13 @@ def test_string_column_roundtrip_with_null() raises:
 
 def test_float64_and_bool_columns_roundtrip_with_nulls() raises:
     """Float64 and Bool columns (each with one null) roundtrip through a real Feather file."""
-    var floats = List[Optional[Float64]]()
-    floats.append(Optional[Float64](5.4))
-    floats.append(Optional[Float64](None))
+    var float_builder = Float64ColumnBuilder()
+    float_builder.append(5.4)
+    float_builder.append_null()
 
-    var bools = List[Optional[Bool]]()
-    bools.append(Optional[Bool](None))
-    bools.append(Optional[Bool](True))
+    var bool_builder = BoolColumnBuilder()
+    bool_builder.append_null()
+    bool_builder.append(True)
 
     var fields = List[ArrowField]()
     fields.append(ArrowField("val", ArrowType.float_(2), True))
@@ -126,8 +126,8 @@ def test_float64_and_bool_columns_roundtrip_with_nulls() raises:
     var schema = ArrowSchema(fields, Int16(0))
 
     var arrays = List[ArrowArray]()
-    arrays.append(build_float64_column(floats))
-    arrays.append(build_bool_column(bools))
+    arrays.append(float_builder.finish())
+    arrays.append(bool_builder.finish())
     var batch = RecordBatch(Int64(2), arrays)
     var batches = List[RecordBatch]()
     batches.append(batch.copy())
@@ -145,6 +145,9 @@ def test_float64_and_bool_columns_roundtrip_with_nulls() raises:
     assert_true(not _is_valid(flag_col, 0), "flag row 0 should be null")
     assert_true(_is_valid(flag_col, 1), "flag row 1 valid")
     assert_true(_get_bool(flag_col, 1), "flag row 1 should be true")
+
+
+# ── Public API: ndjson_to_feather / ndjson_range_to_feather / merge_feathers ──
 
 
 def test_ndjson_to_feather_patient_end_to_end() raises:
@@ -268,68 +271,6 @@ def test_merge_feathers_combines_in_order() raises:
     assert_eq_str(_get_utf8(id_col1, 0), "p3", "merged batch1 row0 id")
 
 
-def test_patients_to_record_batch_preserves_row_order() raises:
-    """Regression test for the row-to-column transpose rewrite:
-    patients_to_record_batch now consumes `rows` via `.pop()` (which
-    consumes from the back) + `.into_parts()` instead of copying each
-    field out of a borrowed reference. Every output column list must be
-    `.reverse()`d back to original order before use -- this test exists
-    specifically to catch a missing/wrong reverse() call, which would
-    silently emit every column in reverse-of-input-file order."""
-    var rows = List[PatientRow]()
-    rows.append(PatientRow("p1", Optional[String]("female"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Bool](None)))
-    rows.append(PatientRow("p2", Optional[String]("male"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Bool](None)))
-    rows.append(PatientRow("p3", Optional[String]("female"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Bool](None)))
-
-    var batch = patients_to_record_batch(rows^)
-    assert_eq_int(Int(batch.length), 3, "row count")
-    var id_col = batch.columns[0].copy()
-    var gender_col = batch.columns[1].copy()
-    assert_eq_str(_get_utf8(id_col, 0), "p1", "row 0 id in original order")
-    assert_eq_str(_get_utf8(id_col, 1), "p2", "row 1 id in original order")
-    assert_eq_str(_get_utf8(id_col, 2), "p3", "row 2 id in original order")
-    assert_eq_str(_get_utf8(gender_col, 0), "female", "row 0 gender matches row 0 id (columns stay aligned)")
-    assert_eq_str(_get_utf8(gender_col, 1), "male", "row 1 gender matches row 1 id (columns stay aligned)")
-
-
-def test_observations_to_record_batch_preserves_row_order() raises:
-    """Same regression coverage as the Patient version, for
-    observations_to_record_batch."""
-    var rows = List[ObservationRow]()
-    rows.append(ObservationRow("o1", Optional[String](None), Optional[String]("code-a"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Float64](None), Optional[String](None), Optional[String](None)))
-    rows.append(ObservationRow("o2", Optional[String](None), Optional[String]("code-b"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Float64](None), Optional[String](None), Optional[String](None)))
-    rows.append(ObservationRow("o3", Optional[String](None), Optional[String]("code-c"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None), Optional[Float64](None), Optional[String](None), Optional[String](None)))
-
-    var batch = observations_to_record_batch(rows^)
-    assert_eq_int(Int(batch.length), 3, "row count")
-    var id_col = batch.columns[0].copy()
-    var code_col = batch.columns[2].copy()
-    assert_eq_str(_get_utf8(id_col, 0), "o1", "row 0 id in original order")
-    assert_eq_str(_get_utf8(id_col, 1), "o2", "row 1 id in original order")
-    assert_eq_str(_get_utf8(id_col, 2), "o3", "row 2 id in original order")
-    assert_eq_str(_get_utf8(code_col, 0), "code-a", "row 0 code matches row 0 id (columns stay aligned)")
-    assert_eq_str(_get_utf8(code_col, 2), "code-c", "row 2 code matches row 2 id (columns stay aligned)")
-
-
-def test_conditions_to_record_batch_preserves_row_order() raises:
-    """Same regression coverage as the Patient version, for
-    conditions_to_record_batch."""
-    var rows = List[ConditionRow]()
-    rows.append(ConditionRow("c1", Optional[String](None), Optional[String]("code-x"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None)))
-    rows.append(ConditionRow("c2", Optional[String](None), Optional[String]("code-y"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None)))
-    rows.append(ConditionRow("c3", Optional[String](None), Optional[String]("code-z"), Optional[String](None), Optional[String](None), Optional[String](None), Optional[String](None)))
-
-    var batch = conditions_to_record_batch(rows^)
-    assert_eq_int(Int(batch.length), 3, "row count")
-    var id_col = batch.columns[0].copy()
-    var code_col = batch.columns[2].copy()
-    assert_eq_str(_get_utf8(id_col, 0), "c1", "row 0 id in original order")
-    assert_eq_str(_get_utf8(id_col, 1), "c2", "row 1 id in original order")
-    assert_eq_str(_get_utf8(id_col, 2), "c3", "row 2 id in original order")
-    assert_eq_str(_get_utf8(code_col, 0), "code-x", "row 0 code matches row 0 id (columns stay aligned)")
-    assert_eq_str(_get_utf8(code_col, 2), "code-z", "row 2 code matches row 2 id (columns stay aligned)")
-
-
 def test_parallel_chunked_equivalent_to_sequential() raises:
     """The explicit equivalence check the v2 performance-roadmap plan requires:
     chunk+merge (the parallel path's building blocks) must produce identical
@@ -418,11 +359,80 @@ def test_parallel_chunked_equivalent_to_sequential() raises:
             )
 
 
-# ── Phase 1: fused extraction-into-columns path (Patient only) ──────────────
+# ── Row order, per resource type ──────────────────────────────────────────────
 #
-# shred_patient_fast (the existing row-returning path) is the correctness
-# oracle here: every case below asserts the fused path produces exactly
-# the same decoded values on the same input.
+# The fused path has no separate row-to-column transpose step (lines are
+# appended directly, in scan order, as they're shredded) -- so there's no
+# `.pop()`/`.reverse()` dance left to get backwards the way the old
+# row-based path's transpose did. Still worth confirming explicitly, not
+# assumed from the design reasoning alone.
+
+
+def test_patient_fused_preserves_row_order() raises:
+    var lines = List[String]()
+    lines.append(String('{"id": "p1", "gender": "female"}'))
+    lines.append(String('{"id": "p2", "gender": "male"}'))
+    lines.append(String('{"id": "p3", "gender": "female"}'))
+
+    var columns = PatientColumns()
+    for i in range(len(lines)):
+        shred_patient_fast_into_columns(lines[i].as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 3, "row count")
+    var id_col = batch.columns[0].copy()
+    var gender_col = batch.columns[1].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "p1", "row 0 id in original order")
+    assert_eq_str(_get_utf8(id_col, 1), "p2", "row 1 id in original order")
+    assert_eq_str(_get_utf8(id_col, 2), "p3", "row 2 id in original order")
+    assert_eq_str(_get_utf8(gender_col, 0), "female", "row 0 gender matches row 0 id")
+    assert_eq_str(_get_utf8(gender_col, 1), "male", "row 1 gender matches row 1 id")
+
+
+def test_observation_fused_preserves_row_order() raises:
+    var lines = List[String]()
+    lines.append(String('{"id": "o1", "code": {"coding": [{"code": "code-a"}]}}'))
+    lines.append(String('{"id": "o2", "code": {"coding": [{"code": "code-b"}]}}'))
+    lines.append(String('{"id": "o3", "code": {"coding": [{"code": "code-c"}]}}'))
+
+    var columns = ObservationColumns()
+    for i in range(len(lines)):
+        shred_observation_fast_into_columns(lines[i].as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 3, "row count")
+    var id_col = batch.columns[0].copy()
+    var code_col = batch.columns[2].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "o1", "row 0 id in original order")
+    assert_eq_str(_get_utf8(id_col, 1), "o2", "row 1 id in original order")
+    assert_eq_str(_get_utf8(id_col, 2), "o3", "row 2 id in original order")
+    assert_eq_str(_get_utf8(code_col, 0), "code-a", "row 0 code matches row 0 id")
+    assert_eq_str(_get_utf8(code_col, 2), "code-c", "row 2 code matches row 2 id")
+
+
+def test_condition_fused_preserves_row_order() raises:
+    var lines = List[String]()
+    lines.append(String('{"id": "c1", "code": {"coding": [{"code": "code-x"}]}}'))
+    lines.append(String('{"id": "c2", "code": {"coding": [{"code": "code-y"}]}}'))
+    lines.append(String('{"id": "c3", "code": {"coding": [{"code": "code-z"}]}}'))
+
+    var columns = ConditionColumns()
+    for i in range(len(lines)):
+        shred_condition_fast_into_columns(lines[i].as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 3, "row count")
+    var id_col = batch.columns[0].copy()
+    var code_col = batch.columns[2].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "c1", "row 0 id in original order")
+    assert_eq_str(_get_utf8(id_col, 1), "c2", "row 1 id in original order")
+    assert_eq_str(_get_utf8(id_col, 2), "c3", "row 2 id in original order")
+    assert_eq_str(_get_utf8(code_col, 0), "code-x", "row 0 code matches row 0 id")
+    assert_eq_str(_get_utf8(code_col, 2), "code-z", "row 2 code matches row 2 id")
+
+
+# ── Fused extraction-into-columns: Patient ────────────────────────────────────
+#
+# Same fixtures the retired shred_patient_fast's tests used; hardcoded
+# expected values now (there's no row-based oracle left to compare
+# against once it's deleted).
 
 
 def test_fused_patient_parity_minimal() raises:
@@ -430,8 +440,6 @@ def test_fused_patient_parity_minimal() raises:
         '{"resourceType": "Patient", "id": "p1", "gender": "female",'
         ' "birthDate": "1990-01-01"}'
     )
-    var oracle = shred_patient_fast(line.as_bytes())
-
     var columns = PatientColumns()
     shred_patient_fast_into_columns(line.as_bytes(), columns)
     var batch = columns^.finish()
@@ -444,28 +452,26 @@ def test_fused_patient_parity_minimal() raises:
     var given_col = batch.columns[4].copy()
     var deceased_col = batch.columns[5].copy()
 
-    assert_eq_str(_get_utf8(id_col, 0), oracle.id, "id matches oracle")
-    assert_eq_str(_get_utf8(gender_col, 0), oracle.gender.value(), "gender matches oracle")
-    assert_eq_str(_get_utf8(birth_col, 0), oracle.birth_date.value(), "birth_date matches oracle")
-    assert_true(not _is_valid(family_col, 0), "family_name null, matches oracle")
-    assert_true(not _is_valid(given_col, 0), "given_name null, matches oracle")
-    assert_true(not _is_valid(deceased_col, 0), "deceased null, matches oracle")
+    assert_eq_str(_get_utf8(id_col, 0), "p1", "id")
+    assert_eq_str(_get_utf8(gender_col, 0), "female", "gender")
+    assert_eq_str(_get_utf8(birth_col, 0), "1990-01-01", "birth_date")
+    assert_true(not _is_valid(family_col, 0), "family_name should be null")
+    assert_true(not _is_valid(given_col, 0), "given_name should be null")
+    assert_true(not _is_valid(deceased_col, 0), "deceased should be null")
 
 
 def test_fused_patient_parity_with_name() raises:
     var line = String(
         '{"id": "p2", "name": [{"family": "Smith", "given": ["Jane", "Q"]}]}'
     )
-    var oracle = shred_patient_fast(line.as_bytes())
-
     var columns = PatientColumns()
     shred_patient_fast_into_columns(line.as_bytes(), columns)
     var batch = columns^.finish()
     var family_col = batch.columns[3].copy()
     var given_col = batch.columns[4].copy()
 
-    assert_eq_str(_get_utf8(family_col, 0), oracle.family_name.value(), "family_name matches oracle")
-    assert_eq_str(_get_utf8(given_col, 0), oracle.given_name.value(), "given_name (first only) matches oracle")
+    assert_eq_str(_get_utf8(family_col, 0), "Smith", "family_name")
+    assert_eq_str(_get_utf8(given_col, 0), "Jane", "given_name (first only)")
 
 
 def test_fused_patient_parity_deceased_boolean() raises:
@@ -486,7 +492,7 @@ def test_fused_patient_missing_id_raises() raises:
         shred_patient_fast_into_columns(line.as_bytes(), columns)
     except:
         raised = True
-    assert_true(raised, "missing id should raise, matching the row-based oracle")
+    assert_true(raised, "missing id should raise")
 
 
 def test_fused_patient_parity_escaped_field() raises:
@@ -495,14 +501,11 @@ def test_fused_patient_parity_escaped_field() raises:
     var line = String(
         '{"id": "p4", "name": [{"family": "O\\"Brien"}]}'
     )
-    var oracle = shred_patient_fast(line.as_bytes())
-
     var columns = PatientColumns()
     shred_patient_fast_into_columns(line.as_bytes(), columns)
     var batch = columns^.finish()
     var family_col = batch.columns[3].copy()
-    assert_eq_str(_get_utf8(family_col, 0), oracle.family_name.value(), "escaped family_name matches oracle")
-    assert_true(_get_utf8(family_col, 0) == 'O"Brien', "escaped quote decoded correctly")
+    assert_eq_str(_get_utf8(family_col, 0), 'O"Brien', "escaped quote decoded correctly")
 
 
 def test_fused_patient_multi_row_column_alignment() raises:
@@ -562,6 +565,359 @@ def test_fused_patient_multi_row_column_alignment() raises:
     assert_true(_get_bool(deceased_col, 2) == True, "row 2 deceased true")
 
 
+# ── Fused extraction-into-columns: Observation ────────────────────────────────
+#
+# Ports every case from the retired shred_observation_fast's tests
+# (including the adversarial ones), hardcoded expected values.
+
+
+def test_fused_observation_value_quantity() raises:
+    var line = String(
+        '{"id": "o1", "status": "final",'
+        ' "subject": {"reference": "Patient/p1"},'
+        ' "code": {"coding": [{"system": "http://loinc.org", "code": "4548-4",'
+        ' "display": "Hemoglobin A1c"}]},'
+        ' "effectiveDateTime": "2024-01-01T00:00:00Z",'
+        ' "valueQuantity": {"value": 5.4, "unit": "%"}}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+
+    var id_col = batch.columns[0].copy()
+    var ref_col = batch.columns[1].copy()
+    var code_col = batch.columns[2].copy()
+    var system_col = batch.columns[3].copy()
+    var display_col = batch.columns[4].copy()
+    var status_col = batch.columns[5].copy()
+    var eff_col = batch.columns[6].copy()
+    var vq_col = batch.columns[7].copy()
+    var vu_col = batch.columns[8].copy()
+    var vs_col = batch.columns[9].copy()
+
+    assert_eq_str(_get_utf8(id_col, 0), "o1", "id")
+    assert_eq_str(_get_utf8(ref_col, 0), "Patient/p1", "patient_ref")
+    assert_eq_str(_get_utf8(code_col, 0), "4548-4", "code")
+    assert_eq_str(_get_utf8(system_col, 0), "http://loinc.org", "code_system")
+    assert_eq_str(_get_utf8(display_col, 0), "Hemoglobin A1c", "code_display")
+    assert_eq_str(_get_utf8(status_col, 0), "final", "status")
+    assert_eq_str(_get_utf8(eff_col, 0), "2024-01-01T00:00:00Z", "effective_datetime")
+    assert_true(_is_valid(vq_col, 0), "value_quantity valid")
+    assert_near(_get_float64(vq_col, 0), 5.4, "value_quantity")
+    assert_eq_str(_get_utf8(vu_col, 0), "%", "value_unit")
+    assert_true(not _is_valid(vs_col, 0), "value_string should be null")
+
+
+def test_fused_observation_value_string() raises:
+    var line = String(
+        '{"id": "o2", "code": {"coding": [{"code": "obs-note"}]},'
+        ' "valueString": "no acute findings"}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var vq_col = batch.columns[7].copy()
+    var vu_col = batch.columns[8].copy()
+    var vs_col = batch.columns[9].copy()
+    assert_eq_str(_get_utf8(vs_col, 0), "no acute findings", "value_string")
+    assert_true(not _is_valid(vq_col, 0), "value_quantity should be null")
+    assert_true(not _is_valid(vu_col, 0), "value_unit should be null")
+
+
+def test_fused_observation_no_value() raises:
+    var line = String('{"id": "o3", "code": {"coding": [{"code": "x"}]}}')
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var vq_col = batch.columns[7].copy()
+    var vs_col = batch.columns[9].copy()
+    assert_true(not _is_valid(vq_col, 0), "value_quantity should be null")
+    assert_true(not _is_valid(vs_col, 0), "value_string should be null")
+
+
+def test_fused_observation_missing_id_raises() raises:
+    var line = String('{"status": "final"}')
+    var columns = ObservationColumns()
+    var raised = False
+    try:
+        shred_observation_fast_into_columns(line.as_bytes(), columns)
+    except:
+        raised = True
+    assert_true(raised, "missing id should raise")
+
+
+def test_fused_observation_note_with_escaped_structural_chars() raises:
+    """A 'note' field (not in our schema, so it's skipped) containing
+    escaped quotes/braces/brackets must not corrupt extraction of the
+    real fields that come after it."""
+    var line = String(
+        '{"id": "o4", "note": "patient said \\"ok\\", {no code} [fine]",'
+        ' "status": "final", "code": {"coding": [{"code": "9279-1"}]}}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var id_col = batch.columns[0].copy()
+    var status_col = batch.columns[5].copy()
+    var code_col = batch.columns[2].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "o4", "id")
+    assert_eq_str(_get_utf8(status_col, 0), "final", "status survives the adversarial note field")
+    assert_eq_str(_get_utf8(code_col, 0), "9279-1", "code survives the adversarial note field")
+
+
+def test_fused_observation_code_key_collision() raises:
+    """'code' exists as a top-level CodeableConcept object AND as a key
+    inside coding[0]. Must extract the nested coding[0].code ('4548-4'),
+    not be confused by the top-level 'code' object itself."""
+    var line = String(
+        '{"id": "o5", "code": {"coding": [{"system": "http://loinc.org",'
+        ' "code": "4548-4", "display": "Hemoglobin A1c"}]}}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var code_col = batch.columns[2].copy()
+    assert_eq_str(_get_utf8(code_col, 0), "4548-4", "should read coding[0].code, not confuse the outer object")
+
+
+def test_fused_observation_out_of_order_with_unknown_fields() raises:
+    """Real Synthea output won't match hand-written fixture key ordering,
+    and carries many fields (meta, text, category, encounter, performer)
+    this v0 doesn't care about, interspersed among the fields it does."""
+    var line = String(
+        '{"resourceType": "Observation",'
+        ' "meta": {"versionId": "1", "lastUpdated": "2024-01-01T00:00:00Z"},'
+        ' "status": "final",'
+        ' "category": [{"coding": [{"system": "http://x", "code": "vital-signs"}]}],'
+        ' "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2",'
+        ' "display": "Body Height"}]},'
+        ' "subject": {"reference": "Patient/p1"},'
+        ' "encounter": {"reference": "Encounter/e1"},'
+        ' "effectiveDateTime": "2024-01-01T00:00:00Z",'
+        ' "valueQuantity": {"value": 170.0, "unit": "cm", "system": "http://unitsofmeasure.org"},'
+        ' "id": "o6"}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var id_col = batch.columns[0].copy()
+    var code_col = batch.columns[2].copy()
+    var ref_col = batch.columns[1].copy()
+    var vq_col = batch.columns[7].copy()
+    var vu_col = batch.columns[8].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "o6", "id found despite appearing last")
+    assert_eq_str(_get_utf8(code_col, 0), "8302-2", "code found past the unrelated category coding array")
+    assert_eq_str(_get_utf8(ref_col, 0), "Patient/p1", "patient_ref")
+    assert_near(_get_float64(vq_col, 0), 170.0, "value_quantity")
+    assert_eq_str(_get_utf8(vu_col, 0), "cm", "value_unit (not confused by valueQuantity.system)")
+
+
+def test_fused_observation_multiple_coding_entries() raises:
+    """Only coding[0] should be read when multiple entries are present."""
+    var line = String(
+        '{"id": "o7", "code": {"coding": ['
+        '{"system": "http://loinc.org", "code": "FIRST", "display": "First Code"},'
+        '{"system": "http://snomed.info/sct", "code": "SECOND", "display": "Second Code"}'
+        ']}}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var code_col = batch.columns[2].copy()
+    var display_col = batch.columns[4].copy()
+    assert_eq_str(_get_utf8(code_col, 0), "FIRST", "only the first coding entry should be read")
+    assert_eq_str(_get_utf8(display_col, 0), "First Code", "only the first coding entry should be read")
+
+
+def test_fused_observation_multi_row_column_alignment() raises:
+    """Same alignment risk as Patient's version, but for Observation's 10
+    columns -- more sibling-column surface, and specifically exercises the
+    polymorphic valueQuantity/valueString branch across rows."""
+    var lines = List[String]()
+    lines.append(String('{"id": "r1", "status": "final", "code": {"coding": [{"code": "c1"}]}, "valueQuantity": {"value": 1.5, "unit": "kg"}}'))
+    lines.append(String('{"id": "r2", "subject": {"reference": "Patient/p9"}, "valueString": "note text"}'))
+    lines.append(String('{"id": "r3", "effectiveDateTime": "2021-01-01"}'))
+
+    var columns = ObservationColumns()
+    for i in range(len(lines)):
+        shred_observation_fast_into_columns(lines[i].as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 3, "three rows")
+
+    var id_col = batch.columns[0].copy()
+    var ref_col = batch.columns[1].copy()
+    var code_col = batch.columns[2].copy()
+    var status_col = batch.columns[5].copy()
+    var eff_col = batch.columns[6].copy()
+    var vq_col = batch.columns[7].copy()
+    var vu_col = batch.columns[8].copy()
+    var vs_col = batch.columns[9].copy()
+
+    assert_eq_str(_get_utf8(id_col, 0), "r1", "row 0 id")
+    assert_eq_str(_get_utf8(id_col, 1), "r2", "row 1 id")
+    assert_eq_str(_get_utf8(id_col, 2), "r3", "row 2 id")
+
+    assert_true(_is_valid(status_col, 0), "row 0 status present")
+    assert_true(not _is_valid(status_col, 1), "row 1 status null (misalignment would leak here)")
+    assert_true(not _is_valid(status_col, 2), "row 2 status null")
+
+    assert_true(not _is_valid(ref_col, 0), "row 0 patient_ref null")
+    assert_true(_is_valid(ref_col, 1), "row 1 patient_ref present")
+    assert_eq_str(_get_utf8(ref_col, 1), "Patient/p9", "row 1 patient_ref value")
+    assert_true(not _is_valid(ref_col, 2), "row 2 patient_ref null")
+
+    assert_true(_is_valid(code_col, 0), "row 0 code present")
+    assert_eq_str(_get_utf8(code_col, 0), "c1", "row 0 code value")
+    assert_true(not _is_valid(code_col, 1), "row 1 code null")
+    assert_true(not _is_valid(code_col, 2), "row 2 code null")
+
+    assert_true(_is_valid(vq_col, 0), "row 0 value_quantity present")
+    assert_near(_get_float64(vq_col, 0), 1.5, "row 0 value_quantity")
+    assert_true(_is_valid(vu_col, 0), "row 0 value_unit present")
+    assert_eq_str(_get_utf8(vu_col, 0), "kg", "row 0 value_unit")
+    assert_true(not _is_valid(vs_col, 0), "row 0 value_string null (only one value[x] variant per row)")
+
+    assert_true(not _is_valid(vq_col, 1), "row 1 value_quantity null")
+    assert_true(not _is_valid(vu_col, 1), "row 1 value_unit null")
+    assert_true(_is_valid(vs_col, 1), "row 1 value_string present")
+    assert_eq_str(_get_utf8(vs_col, 1), "note text", "row 1 value_string")
+
+    assert_true(not _is_valid(vq_col, 2), "row 2 value_quantity null")
+    assert_true(not _is_valid(vs_col, 2), "row 2 value_string null")
+    assert_true(_is_valid(eff_col, 2), "row 2 effective_datetime present")
+    assert_eq_str(_get_utf8(eff_col, 2), "2021-01-01", "row 2 effective_datetime")
+    assert_true(not _is_valid(eff_col, 0), "row 0 effective_datetime null")
+    assert_true(not _is_valid(eff_col, 1), "row 1 effective_datetime null")
+
+
+# ── Fused extraction-into-columns: Condition ──────────────────────────────────
+#
+# Ports every case from the retired shred_condition_fast's tests,
+# hardcoded expected values.
+
+
+def test_fused_condition_full() raises:
+    var line = String(
+        '{"id": "c1", "subject": {"reference": "Patient/p1"},'
+        ' "code": {"coding": [{"code": "44054006", "display": "Diabetes"}]},'
+        ' "clinicalStatus": {"coding": [{"code": "active"}]},'
+        ' "onsetDateTime": "2020-05-01",'
+        ' "recordedDate": "2020-05-02"}'
+    )
+    var columns = ConditionColumns()
+    shred_condition_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+
+    var id_col = batch.columns[0].copy()
+    var ref_col = batch.columns[1].copy()
+    var code_col = batch.columns[2].copy()
+    var display_col = batch.columns[3].copy()
+    var status_col = batch.columns[4].copy()
+    var onset_col = batch.columns[5].copy()
+    var recorded_col = batch.columns[6].copy()
+
+    assert_eq_str(_get_utf8(id_col, 0), "c1", "id")
+    assert_eq_str(_get_utf8(ref_col, 0), "Patient/p1", "patient_ref")
+    assert_eq_str(_get_utf8(code_col, 0), "44054006", "code")
+    assert_eq_str(_get_utf8(display_col, 0), "Diabetes", "code_display")
+    assert_eq_str(_get_utf8(status_col, 0), "active", "clinical_status")
+    assert_eq_str(_get_utf8(onset_col, 0), "2020-05-01", "onset_datetime")
+    assert_eq_str(_get_utf8(recorded_col, 0), "2020-05-02", "recorded_date")
+
+
+def test_fused_condition_no_onset() raises:
+    var line = String('{"id": "c2", "code": {"coding": [{"code": "x"}]}}')
+    var columns = ConditionColumns()
+    shred_condition_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var onset_col = batch.columns[5].copy()
+    assert_true(not _is_valid(onset_col, 0), "onset_datetime should be null")
+
+
+def test_fused_condition_missing_id_raises() raises:
+    var line = String('{"code": {"coding": [{"code": "x"}]}}')
+    var columns = ConditionColumns()
+    var raised = False
+    try:
+        shred_condition_fast_into_columns(line.as_bytes(), columns)
+    except:
+        raised = True
+    assert_true(raised, "missing id should raise")
+
+
+def test_fused_condition_unicode_escape_in_skipped_field() raises:
+    """A unicode escape inside a skipped field (not in our schema) must
+    not desynchronize byte offsets for the fields that follow it."""
+    var line = String(
+        '{"id": "c3", "note": "caf\\u00e9 follow-up",'
+        ' "code": {"coding": [{"code": "44054006", "display": "Diabetes"}]},'
+        ' "onsetDateTime": "2020-05-01"}'
+    )
+    var columns = ConditionColumns()
+    shred_condition_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var id_col = batch.columns[0].copy()
+    var code_col = batch.columns[2].copy()
+    var onset_col = batch.columns[5].copy()
+    assert_eq_str(_get_utf8(id_col, 0), "c3", "id")
+    assert_eq_str(_get_utf8(code_col, 0), "44054006", "code survives the unicode escape in note")
+    assert_eq_str(_get_utf8(onset_col, 0), "2020-05-01", "onset_datetime survives the unicode escape in note")
+
+
+def test_fused_condition_multi_row_column_alignment() raises:
+    """Same alignment risk as Patient/Observation's versions, for
+    Condition's 7 columns."""
+    var lines = List[String]()
+    lines.append(String('{"id": "r1", "subject": {"reference": "Patient/p1"}, "clinicalStatus": {"coding": [{"code": "active"}]}}'))
+    lines.append(String('{"id": "r2", "code": {"coding": [{"code": "c2", "display": "D2"}]}, "recordedDate": "2022-02-02"}'))
+    lines.append(String('{"id": "r3", "onsetDateTime": "2023-03-03"}'))
+
+    var columns = ConditionColumns()
+    for i in range(len(lines)):
+        shred_condition_fast_into_columns(lines[i].as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 3, "three rows")
+
+    var id_col = batch.columns[0].copy()
+    var ref_col = batch.columns[1].copy()
+    var code_col = batch.columns[2].copy()
+    var display_col = batch.columns[3].copy()
+    var status_col = batch.columns[4].copy()
+    var onset_col = batch.columns[5].copy()
+    var recorded_col = batch.columns[6].copy()
+
+    assert_eq_str(_get_utf8(id_col, 0), "r1", "row 0 id")
+    assert_eq_str(_get_utf8(id_col, 1), "r2", "row 1 id")
+    assert_eq_str(_get_utf8(id_col, 2), "r3", "row 2 id")
+
+    assert_true(_is_valid(ref_col, 0), "row 0 patient_ref present")
+    assert_eq_str(_get_utf8(ref_col, 0), "Patient/p1", "row 0 patient_ref value")
+    assert_true(not _is_valid(ref_col, 1), "row 1 patient_ref null (misalignment would leak here)")
+    assert_true(not _is_valid(ref_col, 2), "row 2 patient_ref null")
+
+    assert_true(_is_valid(status_col, 0), "row 0 clinical_status present")
+    assert_eq_str(_get_utf8(status_col, 0), "active", "row 0 clinical_status value")
+    assert_true(not _is_valid(status_col, 1), "row 1 clinical_status null")
+    assert_true(not _is_valid(status_col, 2), "row 2 clinical_status null")
+
+    assert_true(not _is_valid(code_col, 0), "row 0 code null")
+    assert_true(_is_valid(code_col, 1), "row 1 code present")
+    assert_eq_str(_get_utf8(code_col, 1), "c2", "row 1 code value")
+    assert_true(_is_valid(display_col, 1), "row 1 code_display present")
+    assert_eq_str(_get_utf8(display_col, 1), "D2", "row 1 code_display value")
+    assert_true(not _is_valid(code_col, 2), "row 2 code null")
+
+    assert_true(_is_valid(recorded_col, 1), "row 1 recorded_date present")
+    assert_eq_str(_get_utf8(recorded_col, 1), "2022-02-02", "row 1 recorded_date value")
+    assert_true(not _is_valid(recorded_col, 0), "row 0 recorded_date null")
+    assert_true(not _is_valid(recorded_col, 2), "row 2 recorded_date null")
+
+    assert_true(_is_valid(onset_col, 2), "row 2 onset_datetime present")
+    assert_eq_str(_get_utf8(onset_col, 2), "2023-03-03", "row 2 onset_datetime value")
+    assert_true(not _is_valid(onset_col, 0), "row 0 onset_datetime null")
+    assert_true(not _is_valid(onset_col, 1), "row 1 onset_datetime null")
+
+
 def main() raises:
     test_string_column_roundtrip_with_null()
     print("PASS test_string_column_roundtrip_with_null")
@@ -584,17 +940,17 @@ def main() raises:
     test_merge_feathers_combines_in_order()
     print("PASS test_merge_feathers_combines_in_order")
 
-    test_patients_to_record_batch_preserves_row_order()
-    print("PASS test_patients_to_record_batch_preserves_row_order")
-
-    test_observations_to_record_batch_preserves_row_order()
-    print("PASS test_observations_to_record_batch_preserves_row_order")
-
-    test_conditions_to_record_batch_preserves_row_order()
-    print("PASS test_conditions_to_record_batch_preserves_row_order")
-
     test_parallel_chunked_equivalent_to_sequential()
     print("PASS test_parallel_chunked_equivalent_to_sequential")
+
+    test_patient_fused_preserves_row_order()
+    print("PASS test_patient_fused_preserves_row_order")
+
+    test_observation_fused_preserves_row_order()
+    print("PASS test_observation_fused_preserves_row_order")
+
+    test_condition_fused_preserves_row_order()
+    print("PASS test_condition_fused_preserves_row_order")
 
     test_fused_patient_parity_minimal()
     print("PASS test_fused_patient_parity_minimal")
@@ -613,5 +969,47 @@ def main() raises:
 
     test_fused_patient_multi_row_column_alignment()
     print("PASS test_fused_patient_multi_row_column_alignment")
+
+    test_fused_observation_value_quantity()
+    print("PASS test_fused_observation_value_quantity")
+
+    test_fused_observation_value_string()
+    print("PASS test_fused_observation_value_string")
+
+    test_fused_observation_no_value()
+    print("PASS test_fused_observation_no_value")
+
+    test_fused_observation_missing_id_raises()
+    print("PASS test_fused_observation_missing_id_raises")
+
+    test_fused_observation_note_with_escaped_structural_chars()
+    print("PASS test_fused_observation_note_with_escaped_structural_chars")
+
+    test_fused_observation_code_key_collision()
+    print("PASS test_fused_observation_code_key_collision")
+
+    test_fused_observation_out_of_order_with_unknown_fields()
+    print("PASS test_fused_observation_out_of_order_with_unknown_fields")
+
+    test_fused_observation_multiple_coding_entries()
+    print("PASS test_fused_observation_multiple_coding_entries")
+
+    test_fused_observation_multi_row_column_alignment()
+    print("PASS test_fused_observation_multi_row_column_alignment")
+
+    test_fused_condition_full()
+    print("PASS test_fused_condition_full")
+
+    test_fused_condition_no_onset()
+    print("PASS test_fused_condition_no_onset")
+
+    test_fused_condition_missing_id_raises()
+    print("PASS test_fused_condition_missing_id_raises")
+
+    test_fused_condition_unicode_escape_in_skipped_field()
+    print("PASS test_fused_condition_unicode_escape_in_skipped_field")
+
+    test_fused_condition_multi_row_column_alignment()
+    print("PASS test_fused_condition_multi_row_column_alignment")
 
     print("\nAll fhir_arrow builder tests passed.")

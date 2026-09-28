@@ -1,9 +1,27 @@
-# fhir_arrow.mojo: column builders + Feather writers for shredded FHIR rows.
+# fhir_arrow.mojo: streaming column builders + Feather writers for shredded
+# FHIR resources.
 #
-# Uses arrow.mojo's legacy ArrowType/ArrowField/ArrowSchema/ArrowArray/
-# RecordBatch/encode_arrow_file API (proven end-to-end by csv_arrow.mojo),
-# not the newer Phase 1/2 typed-builder API (dtypes/arrays/builders.mojo),
-# which has no bridge to file encoding yet.
+# Fuses field extraction with Arrow column-building: shred_*_fast_into_columns
+# writes decoded bytes directly into a streaming column builder during the
+# scan itself, instead of building a row struct with heap-allocated String
+# fields that a separate transpose step later copies into column buffers.
+# This replaced an earlier two-step design (shred -> row struct -> transpose
+# -> build_*_column) once a real profiling gate confirmed it actually cuts
+# allocator overhead: Patient shredding's allocator-overhead share (measured
+# with the same macOS `sample`-based methodology used to find the original
+# bottleneck) went from 9.9% to 4.7%, roughly halved, and Patient wall-clock
+# went from 3.94ms to 3.37ms (~14% faster) on real Synthea data. The
+# row-based path (PatientRow/ObservationRow/ConditionRow, shred_patient_fast/
+# shred_observation_fast/shred_condition_fast, build_string_column et al.,
+# and the *_to_record_batch transpose functions) has been retired now that
+# all three resource types' fused paths are proven correct and are what
+# production actually uses -- see git history for that code if it's ever
+# needed as a reference.
+#
+# Uses arrow.mojo's legacy ArrowType/ArrowArray/RecordBatch/encode_arrow_file
+# API (proven end-to-end by csv_arrow.mojo), not the newer Phase 1/2
+# typed-builder API (dtypes/arrays/builders.mojo), which still has no bridge
+# to file encoding.
 
 from std.pathlib import Path
 from arrow import (
@@ -12,10 +30,9 @@ from arrow import (
 )
 from flatbuffers import write_i32_le, write_f64_le
 from ndjson import read_ndjson_lines, read_ndjson_range
-from resources import PatientRow, ObservationRow, ConditionRow
 from fast_shred import (
-    shred_patient_fast, shred_observation_fast, shred_condition_fast,
-    _find_keys, _first_array_element, _extract_bool, _decode_escaped_string_into,
+    _find_keys, _find_key, _first_array_element, _coding0_at,
+    _extract_bool, _extract_number, _decode_escaped_string_into,
 )
 
 
@@ -35,144 +52,13 @@ def _pack_bits(bits: List[Bool]) -> List[UInt8]:
     return packed^
 
 
-# ── Column builders ───────────────────────────────────────────────────────────
-
-
-def build_string_column(values: List[Optional[String]]) raises -> ArrowArray:
-    """Nullable Utf8 column from a list of optional strings.
-
-    value_bytes is pre-sized once (total byte length computed up front)
-    and filled via indexed writes rather than growing via `.append()` in
-    a loop: the fix for the buffer-growth cost the v0 benchmark
-    identified as one of the two dominant slowdowns versus Python."""
-    var length = len(values)
-    var null_bits = List[Bool](capacity=length)
-    var null_count = 0
-    var total_bytes = 0
-    for i in range(length):
-        if values[i]:
-            null_bits.append(True)
-            total_bytes += len(values[i].value().as_bytes())
-        else:
-            null_bits.append(False)
-            null_count += 1
-
-    var validity = List[UInt8]()
-    if null_count > 0:
-        validity = _pack_bits(null_bits)
-
-    var offsets = List[UInt8]()
-    for _ in range((length + 1) * 4):
-        offsets.append(UInt8(0))
-    write_i32_le(offsets, 0, Int32(0))
-
-    var value_bytes = List[UInt8]()
-    for _ in range(total_bytes):
-        value_bytes.append(UInt8(0))
-
-    var cur = 0
-    for i in range(length):
-        if values[i]:
-            var sb = values[i].value().as_bytes()
-            var n = len(sb)
-            for j in range(n):
-                value_bytes[cur + j] = sb[j]
-            cur += n
-        write_i32_le(offsets, (i + 1) * 4, Int32(cur))
-
-    return ArrowArray(
-        ArrowType.utf8(), length, null_count, validity, offsets, value_bytes
-    )
-
-
-def build_required_string_column(values: List[String]) raises -> ArrowArray:
-    """Non-nullable Utf8 column (used for `id`, which is always required)."""
-    var opt_values = List[Optional[String]]()
-    for i in range(len(values)):
-        opt_values.append(Optional[String](values[i]))
-    return build_string_column(opt_values)
-
-
-def build_float64_column(values: List[Optional[Float64]]) raises -> ArrowArray:
-    """Nullable Float64 column from a list of optional floats.
-
-    null_bits is capacity-reserved up front (length is known before the
-    loop starts), so the `.append()` loop below never triggers a
-    reallocation: the same buffer-growth fix already applied to
-    build_string_column's value bytes, applied here to the bitmap-source
-    list instead."""
-    var length = len(values)
-    var null_bits = List[Bool](capacity=length)
-    var null_count = 0
-    for i in range(length):
-        if values[i]:
-            null_bits.append(True)
-        else:
-            null_bits.append(False)
-            null_count += 1
-
-    var validity = List[UInt8]()
-    if null_count > 0:
-        validity = _pack_bits(null_bits)
-
-    var value_bytes = List[UInt8]()
-    for _ in range(length * 8):
-        value_bytes.append(UInt8(0))
-    for i in range(length):
-        var f = Float64(0.0)
-        if values[i]:
-            f = values[i].value()
-        write_f64_le(value_bytes, i * 8, f)
-
-    return ArrowArray(
-        ArrowType.float_(2), length, null_count, validity, List[UInt8](), value_bytes
-    )
-
-
-def build_bool_column(values: List[Optional[Bool]]) raises -> ArrowArray:
-    """Nullable Bool column. Values buffer is packed bits, LSB-first (same
-    scheme as the validity bitmap, per arrow.mojo's decode/encode).
-    Both bit-source lists are capacity-reserved up front, same reasoning
-    as build_float64_column's null_bits."""
-    var length = len(values)
-    var null_bits = List[Bool](capacity=length)
-    var value_bits = List[Bool](capacity=length)
-    var null_count = 0
-    for i in range(length):
-        if values[i]:
-            null_bits.append(True)
-            value_bits.append(values[i].value())
-        else:
-            null_bits.append(False)
-            value_bits.append(False)
-            null_count += 1
-
-    var validity = List[UInt8]()
-    if null_count > 0:
-        validity = _pack_bits(null_bits)
-
-    var value_bytes = _pack_bits(value_bits)
-
-    return ArrowArray(
-        ArrowType.bool_(), length, null_count, validity, List[UInt8](), value_bytes
-    )
-
-
-# ── Patient: schema + RecordBatch assembly ───────────────────────────────────
-
-
-# ── Phase 1 prototype: fuse extraction with column-building (Patient only) ───
+# ── Streaming Arrow column builders ───────────────────────────────────────────
 #
-# The row-based path above (shred_patient_fast -> PatientRow -> into_parts()
-# -> build_string_column) still allocates one String per string field per
-# row during shredding, even after the transpose-copy fix removed the
-# second copy. This prototype writes decoded bytes directly into a
-# streaming Arrow column builder during the scan itself, skipping the
-# per-field String entirely for the common (escape-free) case. Kept
-# side-by-side with shred_patient_fast/patients_to_record_batch, which
-# stay untouched as the correctness oracle for this phase -- not wired
-# into ndjson_to_feather yet, pending the real-profiling gate check this
-# phase exists to run.
+# append_json_string/append/append_null write directly into each builder's
+# own growing buffer as each row is shredded -- no intermediate String or
+# List[Optional[...]] per row. finish() produces the exact ArrowArray shape
+# real Arrow expects, so nothing about schema/RecordBatch assembly or
+# encode_arrow_file needed to change to adopt this.
 
 comptime _FUSED_QUOTE = UInt8(34)      # '"'
 comptime _FUSED_BACKSLASH = UInt8(92)  # '\'
@@ -185,9 +71,7 @@ struct StringColumnBuilder(Movable):
     escape-free fast case (the common one), matching
     fast_shred._extract_string's fast/escaped-fallback split but writing
     straight into self.values instead of building a String only to have
-    build_string_column copy it again later. finish() produces the exact
-    ArrowArray shape build_string_column already produces, so nothing
-    downstream (schema, RecordBatch, encode_arrow_file) needs to change."""
+    a separate step copy it again later."""
 
     var values: List[UInt8]
     var offsets: List[UInt8]
@@ -246,8 +130,7 @@ struct StringColumnBuilder(Movable):
 
 
 struct BoolColumnBuilder(Movable):
-    """Streaming Bool Arrow column builder, same packed-bits shape
-    build_bool_column already produces."""
+    """Streaming Bool Arrow column builder: packed bits, LSB-first."""
 
     var null_bits: List[Bool]
     var value_bits: List[Bool]
@@ -281,6 +164,50 @@ struct BoolColumnBuilder(Movable):
         )
 
 
+struct Float64ColumnBuilder(Movable):
+    """Streaming Float64 Arrow column builder. Same pre-size-then-indexed-
+    write shape as StringColumnBuilder's offsets (_push_value), not a
+    per-byte append loop -- 8 zero bytes reserved then written in place."""
+
+    var values: List[UInt8]
+    var null_bits: List[Bool]
+    var length: Int
+    var null_count: Int
+
+    def __init__(out self):
+        self.values = List[UInt8]()
+        self.null_bits = List[Bool]()
+        self.length = 0
+        self.null_count = 0
+
+    def _push_value(mut self, val: Float64) raises:
+        for _ in range(8):
+            self.values.append(UInt8(0))
+        write_f64_le(self.values, len(self.values) - 8, val)
+
+    def append(mut self, val: Float64) raises:
+        self._push_value(val)
+        self.null_bits.append(True)
+        self.length += 1
+
+    def append_null(mut self) raises:
+        self._push_value(Float64(0.0))
+        self.null_bits.append(False)
+        self.null_count += 1
+        self.length += 1
+
+    def finish(mut self) raises -> ArrowArray:
+        var validity = List[UInt8]()
+        if self.null_count > 0:
+            validity = _pack_bits(self.null_bits)
+        return ArrowArray(
+            ArrowType.float_(2), self.length, self.null_count, validity, List[UInt8](), self.values^
+        )
+
+
+# ── Patient ────────────────────────────────────────────────────────────────────
+
+
 struct PatientColumns(Movable):
     var id: StringColumnBuilder
     var gender: StringColumnBuilder
@@ -312,15 +239,16 @@ struct PatientColumns(Movable):
 def shred_patient_fast_into_columns(
     b: Span[UInt8, _], mut columns: PatientColumns
 ) raises:
-    """Fused equivalent of fast_shred.shred_patient_fast: identical
-    field-finding logic (_find_keys/_first_array_element/_extract_bool,
-    unchanged), but appends decoded values directly into the passed-in
-    column builders instead of constructing a PatientRow. Every column
-    MUST get exactly one append/append_null call per invocation, in the
-    same fixed order every time -- a missing call silently misaligns
-    every subsequent row in that column relative to the others, which is
-    the one new correctness risk this design introduces (tested
-    explicitly in test_fhir_arrow.mojo, not just field-value checks)."""
+    """Field-finding logic identical to the retired shred_patient_fast
+    (_find_keys/_first_array_element/_extract_bool, unchanged) -- only the
+    destination of decoded values differs: appended directly into the
+    passed-in column builders instead of constructing a row struct. Every
+    column MUST get exactly one append/append_null call per invocation, in
+    the same fixed order every time -- a missing call silently misaligns
+    every subsequent row in that column relative to the others, the one
+    new correctness risk this design introduces (tested explicitly in
+    test_fhir_arrow.mojo's column-alignment tests, not just field-value
+    checks)."""
     var top_keys: List[String] = ["id", "gender", "birthDate", "name", "deceasedBoolean"]
     var top = _find_keys(b, 0, top_keys)
 
@@ -364,30 +292,6 @@ def shred_patient_fast_into_columns(
         columns.deceased.append_null()
 
 
-def patients_to_feather_fused(ndjson_path: String, out_path: String) raises:
-    """Same output as patients_to_feather(shred_patient_fast(...)), but via
-    the fused columns-write path above. No .pop()/reverse dance needed --
-    lines are iterated in original order and appended directly in that
-    order, so there's no separate row-to-column transpose step left to
-    get backwards."""
-    var result = read_ndjson_lines(ndjson_path)
-    var content = result[0]
-    var spans = result[1].copy()
-    var b = content.as_bytes()
-
-    var columns = PatientColumns()
-    for i in range(len(spans)):
-        var span = spans[i]
-        shred_patient_fast_into_columns(b[span[0] : span[1]], columns)
-
-    var schema = patient_schema()
-    var batch = columns^.finish()
-    var batches = List[RecordBatch]()
-    batches.append(batch^)
-    var file_bytes = encode_arrow_file(schema, batches)
-    Path(out_path).write_bytes(file_bytes)
-
-
 def patient_schema() -> ArrowSchema:
     var fields = List[ArrowField]()
     fields.append(ArrowField("id", ArrowType.utf8(), False))
@@ -399,56 +303,128 @@ def patient_schema() -> ArrowSchema:
     return ArrowSchema(fields, Int16(0))
 
 
-def patients_to_record_batch(var rows: List[PatientRow]) raises -> RecordBatch:
-    """Consumes `rows`: moves each field out via into_parts() instead of
-    copying it out of a borrowed reference, since every field was already
-    allocated once during shredding -- a second copy here would double
-    the allocation cost for no reason. `.pop()` consumes from the back,
-    so columns are built in reverse row order and then reversed once
-    each before use (single O(n) pass per column, not per-element)."""
-    var n = len(rows)
-    var ids = List[String](capacity=n)
-    var genders = List[Optional[String]](capacity=n)
-    var birth_dates = List[Optional[String]](capacity=n)
-    var family_names = List[Optional[String]](capacity=n)
-    var given_names = List[Optional[String]](capacity=n)
-    var deceased = List[Optional[Bool]](capacity=n)
-    while len(rows) > 0:
-        var row = rows.pop()
-        var parts = row^.into_parts()
-        ids.append(parts[0])
-        genders.append(parts[1])
-        birth_dates.append(parts[2])
-        family_names.append(parts[3])
-        given_names.append(parts[4])
-        deceased.append(parts[5])
-    ids.reverse()
-    genders.reverse()
-    birth_dates.reverse()
-    family_names.reverse()
-    given_names.reverse()
-    deceased.reverse()
-
-    var arrays = List[ArrowArray]()
-    arrays.append(build_required_string_column(ids))
-    arrays.append(build_string_column(genders))
-    arrays.append(build_string_column(birth_dates))
-    arrays.append(build_string_column(family_names))
-    arrays.append(build_string_column(given_names))
-    arrays.append(build_bool_column(deceased))
-    return RecordBatch(Int64(n), arrays)
+# ── Observation ──────────────────────────────────────────────────────────────
 
 
-def patients_to_feather(var rows: List[PatientRow], path: String) raises:
-    var schema = patient_schema()
-    var batch = patients_to_record_batch(rows^)
-    var batches = List[RecordBatch]()
-    batches.append(batch^)
-    var file_bytes = encode_arrow_file(schema, batches)
-    Path(path).write_bytes(file_bytes)
+struct ObservationColumns(Movable):
+    var id: StringColumnBuilder
+    var patient_ref: StringColumnBuilder
+    var code: StringColumnBuilder
+    var code_system: StringColumnBuilder
+    var code_display: StringColumnBuilder
+    var status: StringColumnBuilder
+    var effective_datetime: StringColumnBuilder
+    var value_quantity: Float64ColumnBuilder
+    var value_unit: StringColumnBuilder
+    var value_string: StringColumnBuilder
+
+    def __init__(out self):
+        self.id = StringColumnBuilder()
+        self.patient_ref = StringColumnBuilder()
+        self.code = StringColumnBuilder()
+        self.code_system = StringColumnBuilder()
+        self.code_display = StringColumnBuilder()
+        self.status = StringColumnBuilder()
+        self.effective_datetime = StringColumnBuilder()
+        self.value_quantity = Float64ColumnBuilder()
+        self.value_unit = StringColumnBuilder()
+        self.value_string = StringColumnBuilder()
+
+    def finish(deinit self) raises -> RecordBatch:
+        var n = self.id.length
+        var arrays = List[ArrowArray]()
+        arrays.append(self.id^.finish())
+        arrays.append(self.patient_ref^.finish())
+        arrays.append(self.code^.finish())
+        arrays.append(self.code_system^.finish())
+        arrays.append(self.code_display^.finish())
+        arrays.append(self.status^.finish())
+        arrays.append(self.effective_datetime^.finish())
+        arrays.append(self.value_quantity.finish())
+        arrays.append(self.value_unit^.finish())
+        arrays.append(self.value_string^.finish())
+        return RecordBatch(Int64(n), arrays)
 
 
-# ── Observation: schema + RecordBatch assembly ───────────────────────────────
+def shred_observation_fast_into_columns(
+    b: Span[UInt8, _], mut columns: ObservationColumns
+) raises:
+    """Field-finding logic identical to the retired shred_observation_fast
+    -- see shred_patient_fast_into_columns for the general design note."""
+    var top_keys: List[String] = [
+        "id", "subject", "code", "status", "effectiveDateTime",
+        "valueQuantity", "valueString",
+    ]
+    var top = _find_keys(b, 0, top_keys)
+
+    if not top[0]:
+        raise Error("fhir_arrow: shred_observation_fast_into_columns: missing required field 'id'")
+    columns.id.append_json_string(b, top[0].value())
+
+    var ref_appended = False
+    if top[1]:
+        var ref_start = _find_key(b, top[1].value(), "reference")
+        if ref_start:
+            columns.patient_ref.append_json_string(b, ref_start.value())
+            ref_appended = True
+    if not ref_appended:
+        columns.patient_ref.append_null()
+
+    var code_appended = False
+    var code_system_appended = False
+    var code_display_appended = False
+    if top[2]:
+        var coding0_start = _coding0_at(b, top[2].value())
+        if coding0_start:
+            var coding_keys: List[String] = ["code", "system", "display"]
+            var coding_fields = _find_keys(b, coding0_start.value(), coding_keys)
+            if coding_fields[0]:
+                columns.code.append_json_string(b, coding_fields[0].value())
+                code_appended = True
+            if coding_fields[1]:
+                columns.code_system.append_json_string(b, coding_fields[1].value())
+                code_system_appended = True
+            if coding_fields[2]:
+                columns.code_display.append_json_string(b, coding_fields[2].value())
+                code_display_appended = True
+    if not code_appended:
+        columns.code.append_null()
+    if not code_system_appended:
+        columns.code_system.append_null()
+    if not code_display_appended:
+        columns.code_display.append_null()
+
+    if top[3]:
+        columns.status.append_json_string(b, top[3].value())
+    else:
+        columns.status.append_null()
+
+    if top[4]:
+        columns.effective_datetime.append_json_string(b, top[4].value())
+    else:
+        columns.effective_datetime.append_null()
+
+    var vq_appended = False
+    var vu_appended = False
+    var vs_appended = False
+    if top[5]:
+        var vq_keys: List[String] = ["value", "unit"]
+        var vq_fields = _find_keys(b, top[5].value(), vq_keys)
+        if vq_fields[0]:
+            columns.value_quantity.append(_extract_number(b, vq_fields[0].value()))
+            vq_appended = True
+        if vq_fields[1]:
+            columns.value_unit.append_json_string(b, vq_fields[1].value())
+            vu_appended = True
+    elif top[6]:
+        columns.value_string.append_json_string(b, top[6].value())
+        vs_appended = True
+    if not vq_appended:
+        columns.value_quantity.append_null()
+    if not vu_appended:
+        columns.value_unit.append_null()
+    if not vs_appended:
+        columns.value_string.append_null()
 
 
 def observation_schema() -> ArrowSchema:
@@ -466,68 +442,103 @@ def observation_schema() -> ArrowSchema:
     return ArrowSchema(fields, Int16(0))
 
 
-def observations_to_record_batch(var rows: List[ObservationRow]) raises -> RecordBatch:
-    """Consumes `rows` -- see patients_to_record_batch for why (avoids a
-    second copy of every already-allocated field)."""
-    var n = len(rows)
-    var ids = List[String](capacity=n)
-    var patient_refs = List[Optional[String]](capacity=n)
-    var codes = List[Optional[String]](capacity=n)
-    var code_systems = List[Optional[String]](capacity=n)
-    var code_displays = List[Optional[String]](capacity=n)
-    var statuses = List[Optional[String]](capacity=n)
-    var effective_datetimes = List[Optional[String]](capacity=n)
-    var value_quantities = List[Optional[Float64]](capacity=n)
-    var value_units = List[Optional[String]](capacity=n)
-    var value_strings = List[Optional[String]](capacity=n)
-    while len(rows) > 0:
-        var row = rows.pop()
-        var parts = row^.into_parts()
-        ids.append(parts[0])
-        patient_refs.append(parts[1])
-        codes.append(parts[2])
-        code_systems.append(parts[3])
-        code_displays.append(parts[4])
-        statuses.append(parts[5])
-        effective_datetimes.append(parts[6])
-        value_quantities.append(parts[7])
-        value_units.append(parts[8])
-        value_strings.append(parts[9])
-    ids.reverse()
-    patient_refs.reverse()
-    codes.reverse()
-    code_systems.reverse()
-    code_displays.reverse()
-    statuses.reverse()
-    effective_datetimes.reverse()
-    value_quantities.reverse()
-    value_units.reverse()
-    value_strings.reverse()
-
-    var arrays = List[ArrowArray]()
-    arrays.append(build_required_string_column(ids))
-    arrays.append(build_string_column(patient_refs))
-    arrays.append(build_string_column(codes))
-    arrays.append(build_string_column(code_systems))
-    arrays.append(build_string_column(code_displays))
-    arrays.append(build_string_column(statuses))
-    arrays.append(build_string_column(effective_datetimes))
-    arrays.append(build_float64_column(value_quantities))
-    arrays.append(build_string_column(value_units))
-    arrays.append(build_string_column(value_strings))
-    return RecordBatch(Int64(n), arrays)
+# ── Condition ────────────────────────────────────────────────────────────────
 
 
-def observations_to_feather(var rows: List[ObservationRow], path: String) raises:
-    var schema = observation_schema()
-    var batch = observations_to_record_batch(rows^)
-    var batches = List[RecordBatch]()
-    batches.append(batch^)
-    var file_bytes = encode_arrow_file(schema, batches)
-    Path(path).write_bytes(file_bytes)
+struct ConditionColumns(Movable):
+    var id: StringColumnBuilder
+    var patient_ref: StringColumnBuilder
+    var code: StringColumnBuilder
+    var code_display: StringColumnBuilder
+    var clinical_status: StringColumnBuilder
+    var onset_datetime: StringColumnBuilder
+    var recorded_date: StringColumnBuilder
+
+    def __init__(out self):
+        self.id = StringColumnBuilder()
+        self.patient_ref = StringColumnBuilder()
+        self.code = StringColumnBuilder()
+        self.code_display = StringColumnBuilder()
+        self.clinical_status = StringColumnBuilder()
+        self.onset_datetime = StringColumnBuilder()
+        self.recorded_date = StringColumnBuilder()
+
+    def finish(deinit self) raises -> RecordBatch:
+        var n = self.id.length
+        var arrays = List[ArrowArray]()
+        arrays.append(self.id^.finish())
+        arrays.append(self.patient_ref^.finish())
+        arrays.append(self.code^.finish())
+        arrays.append(self.code_display^.finish())
+        arrays.append(self.clinical_status^.finish())
+        arrays.append(self.onset_datetime^.finish())
+        arrays.append(self.recorded_date^.finish())
+        return RecordBatch(Int64(n), arrays)
 
 
-# ── Condition: schema + RecordBatch assembly ─────────────────────────────────
+def shred_condition_fast_into_columns(
+    b: Span[UInt8, _], mut columns: ConditionColumns
+) raises:
+    """Field-finding logic identical to the retired shred_condition_fast
+    -- see shred_patient_fast_into_columns for the general design note."""
+    var top_keys: List[String] = [
+        "id", "subject", "code", "clinicalStatus", "onsetDateTime", "recordedDate",
+    ]
+    var top = _find_keys(b, 0, top_keys)
+
+    if not top[0]:
+        raise Error("fhir_arrow: shred_condition_fast_into_columns: missing required field 'id'")
+    columns.id.append_json_string(b, top[0].value())
+
+    var ref_appended = False
+    if top[1]:
+        var ref_start = _find_key(b, top[1].value(), "reference")
+        if ref_start:
+            columns.patient_ref.append_json_string(b, ref_start.value())
+            ref_appended = True
+    if not ref_appended:
+        columns.patient_ref.append_null()
+
+    var code_appended = False
+    var code_display_appended = False
+    if top[2]:
+        var coding0_start = _coding0_at(b, top[2].value())
+        if coding0_start:
+            var coding_keys: List[String] = ["code", "display"]
+            var coding_fields = _find_keys(b, coding0_start.value(), coding_keys)
+            if coding_fields[0]:
+                columns.code.append_json_string(b, coding_fields[0].value())
+                code_appended = True
+            if coding_fields[1]:
+                columns.code_display.append_json_string(b, coding_fields[1].value())
+                code_display_appended = True
+    if not code_appended:
+        columns.code.append_null()
+    if not code_display_appended:
+        columns.code_display.append_null()
+
+    var cs_appended = False
+    if top[3]:
+        var cs_coding_start = _find_key(b, top[3].value(), "coding")
+        if cs_coding_start:
+            var cs0_start = _first_array_element(b, cs_coding_start.value())
+            if cs0_start:
+                var cs_code_field = _find_key(b, cs0_start.value(), "code")
+                if cs_code_field:
+                    columns.clinical_status.append_json_string(b, cs_code_field.value())
+                    cs_appended = True
+    if not cs_appended:
+        columns.clinical_status.append_null()
+
+    if top[4]:
+        columns.onset_datetime.append_json_string(b, top[4].value())
+    else:
+        columns.onset_datetime.append_null()
+
+    if top[5]:
+        columns.recorded_date.append_json_string(b, top[5].value())
+    else:
+        columns.recorded_date.append_null()
 
 
 def condition_schema() -> ArrowSchema:
@@ -542,89 +553,66 @@ def condition_schema() -> ArrowSchema:
     return ArrowSchema(fields, Int16(0))
 
 
-def conditions_to_record_batch(var rows: List[ConditionRow]) raises -> RecordBatch:
-    """Consumes `rows` -- see patients_to_record_batch for why (avoids a
-    second copy of every already-allocated field)."""
-    var n = len(rows)
-    var ids = List[String](capacity=n)
-    var patient_refs = List[Optional[String]](capacity=n)
-    var codes = List[Optional[String]](capacity=n)
-    var code_displays = List[Optional[String]](capacity=n)
-    var clinical_statuses = List[Optional[String]](capacity=n)
-    var onset_datetimes = List[Optional[String]](capacity=n)
-    var recorded_dates = List[Optional[String]](capacity=n)
-    while len(rows) > 0:
-        var row = rows.pop()
-        var parts = row^.into_parts()
-        ids.append(parts[0])
-        patient_refs.append(parts[1])
-        codes.append(parts[2])
-        code_displays.append(parts[3])
-        clinical_statuses.append(parts[4])
-        onset_datetimes.append(parts[5])
-        recorded_dates.append(parts[6])
-    ids.reverse()
-    patient_refs.reverse()
-    codes.reverse()
-    code_displays.reverse()
-    clinical_statuses.reverse()
-    onset_datetimes.reverse()
-    recorded_dates.reverse()
-
-    var arrays = List[ArrowArray]()
-    arrays.append(build_required_string_column(ids))
-    arrays.append(build_string_column(patient_refs))
-    arrays.append(build_string_column(codes))
-    arrays.append(build_string_column(code_displays))
-    arrays.append(build_string_column(clinical_statuses))
-    arrays.append(build_string_column(onset_datetimes))
-    arrays.append(build_string_column(recorded_dates))
-    return RecordBatch(Int64(n), arrays)
-
-
-def conditions_to_feather(var rows: List[ConditionRow], path: String) raises:
-    var schema = condition_schema()
-    var batch = conditions_to_record_batch(rows^)
-    var batches = List[RecordBatch]()
-    batches.append(batch^)
-    var file_bytes = encode_arrow_file(schema, batches)
-    Path(path).write_bytes(file_bytes)
-
-
 # ── End-to-end orchestration ──────────────────────────────────────────────────
+
+
+def _shred_patient_lines(b: Span[UInt8, _], spans: List[Tuple[Int, Int]]) raises -> RecordBatch:
+    var columns = PatientColumns()
+    for i in range(len(spans)):
+        var span = spans[i]
+        shred_patient_fast_into_columns(b[span[0] : span[1]], columns)
+    return columns^.finish()
+
+
+def _shred_observation_lines(b: Span[UInt8, _], spans: List[Tuple[Int, Int]]) raises -> RecordBatch:
+    var columns = ObservationColumns()
+    for i in range(len(spans)):
+        var span = spans[i]
+        shred_observation_fast_into_columns(b[span[0] : span[1]], columns)
+    return columns^.finish()
+
+
+def _shred_condition_lines(b: Span[UInt8, _], spans: List[Tuple[Int, Int]]) raises -> RecordBatch:
+    var columns = ConditionColumns()
+    for i in range(len(spans)):
+        var span = spans[i]
+        shred_condition_fast_into_columns(b[span[0] : span[1]], columns)
+    return columns^.finish()
 
 
 def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raises:
     """Read a Bulk FHIR NDJSON export file of one resource type and write a
     Feather file of its shredded columns. `kind` is one of "Patient",
-    "Observation", "Condition". Uses the zero-tree fast_shred path: raw
-    lines are never parsed into a JsonValue tree, only the specific fields
-    each row struct needs are ever decoded. The file is read once into one
-    buffer; each record is shredded directly from a byte-span slice of
-    that buffer, with no per-line String allocated to read it."""
+    "Observation", "Condition". Uses the zero-tree fast_shred scanning
+    primitives, fused directly into Arrow column builders: raw lines are
+    never parsed into a JsonValue tree, and no per-field String or row
+    struct is ever allocated -- only the specific fields each schema needs
+    are ever decoded, straight into their column's buffer. The file is
+    read once into one buffer; each record is shredded directly from a
+    byte-span slice of that buffer."""
     var result = read_ndjson_lines(ndjson_path)
     var content = result[0]
     var spans = result[1].copy()
     var b = content.as_bytes()
 
     if kind == "Patient":
-        var rows = List[PatientRow](capacity=len(spans))
-        for i in range(len(spans)):
-            var span = spans[i]
-            rows.append(shred_patient_fast(b[span[0] : span[1]]))
-        patients_to_feather(rows^, out_path)
+        var batch = _shred_patient_lines(b, spans)
+        var batches = List[RecordBatch]()
+        batches.append(batch^)
+        var file_bytes = encode_arrow_file(patient_schema(), batches)
+        Path(out_path).write_bytes(file_bytes)
     elif kind == "Observation":
-        var rows = List[ObservationRow](capacity=len(spans))
-        for i in range(len(spans)):
-            var span = spans[i]
-            rows.append(shred_observation_fast(b[span[0] : span[1]]))
-        observations_to_feather(rows^, out_path)
+        var batch = _shred_observation_lines(b, spans)
+        var batches = List[RecordBatch]()
+        batches.append(batch^)
+        var file_bytes = encode_arrow_file(observation_schema(), batches)
+        Path(out_path).write_bytes(file_bytes)
     elif kind == "Condition":
-        var rows = List[ConditionRow](capacity=len(spans))
-        for i in range(len(spans)):
-            var span = spans[i]
-            rows.append(shred_condition_fast(b[span[0] : span[1]]))
-        conditions_to_feather(rows^, out_path)
+        var batch = _shred_condition_lines(b, spans)
+        var batches = List[RecordBatch]()
+        batches.append(batch^)
+        var file_bytes = encode_arrow_file(condition_schema(), batches)
+        Path(out_path).write_bytes(file_bytes)
     else:
         raise Error(
             "fhir_arrow: ndjson_to_feather: unknown resource kind '"
@@ -642,38 +630,30 @@ def ndjson_range_to_feather(
     one process per byte-range chunk (boundaries computed once, up front, by
     chunk_planner.mojo -- NOT recomputed per worker), each producing its own
     Feather file, later combined by merge_feathers into one file with
-    multiple RecordBatches (row order preserved by chunk order).
-
-    An earlier version of this function took a (start_idx, end_idx) row-index
-    range into the FULL file's span list, which required every worker to
-    read_ndjson_lines the WHOLE file to compute that list -- measured
-    directly: 8 workers each redundantly paying the full-file read+scan cost
-    made an 8-worker Observation run slower than sequential (4748ms vs
-    2132ms). This byte-range version is what actually gets each worker's
-    cost to scale with its own chunk size instead of the whole file."""
+    multiple RecordBatches (row order preserved by chunk order)."""
     var result = read_ndjson_range(ndjson_path, start_byte, end_byte)
     var content = result[0]
     var spans = result[1].copy()
     var b = content.as_bytes()
 
     if kind == "Patient":
-        var rows = List[PatientRow](capacity=len(spans))
-        for i in range(len(spans)):
-            var span = spans[i]
-            rows.append(shred_patient_fast(b[span[0] : span[1]]))
-        patients_to_feather(rows^, out_path)
+        var batch = _shred_patient_lines(b, spans)
+        var batches = List[RecordBatch]()
+        batches.append(batch^)
+        var file_bytes = encode_arrow_file(patient_schema(), batches)
+        Path(out_path).write_bytes(file_bytes)
     elif kind == "Observation":
-        var rows = List[ObservationRow](capacity=len(spans))
-        for i in range(len(spans)):
-            var span = spans[i]
-            rows.append(shred_observation_fast(b[span[0] : span[1]]))
-        observations_to_feather(rows^, out_path)
+        var batch = _shred_observation_lines(b, spans)
+        var batches = List[RecordBatch]()
+        batches.append(batch^)
+        var file_bytes = encode_arrow_file(observation_schema(), batches)
+        Path(out_path).write_bytes(file_bytes)
     elif kind == "Condition":
-        var rows = List[ConditionRow](capacity=len(spans))
-        for i in range(len(spans)):
-            var span = spans[i]
-            rows.append(shred_condition_fast(b[span[0] : span[1]]))
-        conditions_to_feather(rows^, out_path)
+        var batch = _shred_condition_lines(b, spans)
+        var batches = List[RecordBatch]()
+        batches.append(batch^)
+        var file_bytes = encode_arrow_file(condition_schema(), batches)
+        Path(out_path).write_bytes(file_bytes)
     else:
         raise Error(
             "fhir_arrow: ndjson_range_to_feather: unknown resource kind '"

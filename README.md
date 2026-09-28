@@ -56,34 +56,36 @@ rows.
 NDJSON file (one FHIR resource per line)
         |
         v
-  read_ndjson_lines()    ndjson.mojo: splits into raw line Strings.
-        |                No JSON parsing happens here at all.
+  read_ndjson_lines()    ndjson.mojo: reads the file once into one owned
+        |                buffer and returns (content, spans), where spans
+        |                are zero-copy (start, end) byte offsets into it.
+        |                No JSON parsing, no per-line allocation.
         v
-  List[String]
+  Span[UInt8] per line (zero-copy slices of one buffer)
         |
         v
-  shred_patient_fast() / shred_observation_fast() / shred_condition_fast()
-        |                fast_shred.mojo: scans each line's raw bytes
-        |                directly and decodes ONLY the handful of known
-        |                fields the v0 schema cares about (name[0].family,
-        |                code.coding[0], the value[x] polymorphic choice,
-        |                ...). Everything else is skipped in O(bytes)
-        |                without ever allocating a representation for it.
-        |                No JsonValue tree is built for the resource as a
-        |                whole. Only `id` is required; everything else
-        |                missing = null, not an error.
+  shred_patient_fast_into_columns() / shred_observation_fast_into_columns()
+  / shred_condition_fast_into_columns()
+        |                fast_shred.mojo's scanning primitives
+        |                (_find_keys/_coding0_at/_extract_number/...)
+        |                decode ONLY the handful of known fields the v0
+        |                schema cares about (name[0].family, code.coding[0],
+        |                the value[x] polymorphic choice, ...), writing
+        |                decoded bytes DIRECTLY into the column builders
+        |                below -- fused into the same scan, not via an
+        |                intermediate row struct with heap-allocated
+        |                String fields (see Benchmark -> Phase H/Phase 2).
+        |                Everything else is skipped in O(bytes) without
+        |                ever allocating a representation for it. Only
+        |                `id` is required; everything else missing = null.
         v
-  List[PatientRow] / List[ObservationRow] / List[ConditionRow]
-        |
-        v
-  patients_to_feather() / observations_to_feather() / conditions_to_feather()
-        |                fhir_arrow.mojo: one column builder per Arrow
-        |                type (Utf8/Float64/Bool), assembled into a
-        |                RecordBatch, encoded via arrow.mojo's legacy
-        |                ArrowType/ArrowArray/encode_arrow_file API.
-        |                String columns are pre-sized once from a total
-        |                byte-length pass, then filled via indexed writes,
-        |                not grown one byte at a time via `.append()`.
+  PatientColumns / ObservationColumns / ConditionColumns
+        |                fhir_arrow.mojo: StringColumnBuilder/
+        |                BoolColumnBuilder/Float64ColumnBuilder, one per
+        |                Arrow type, appended into directly as each line is
+        |                shredded. finish() assembles a RecordBatch, encoded
+        |                via arrow.mojo's legacy ArrowType/ArrowArray/
+        |                encode_arrow_file API.
         v
   patients.feather / observations.feather / conditions.feather
 ```
@@ -657,10 +659,75 @@ just "same row count."
   this session where the profiler actually confirms the predicted
   mechanism, not just a wall-clock number moving the right direction.
 
-**Not yet done**: Phase 1 deliberately stops at Patient only, per the
-plan's staging — Observation and Condition (the bigger payoff, since
-Observation dominates total pipeline time) are a separate decision point,
-along with retiring the row-based shredders once all three are proven.
+### Phase 2: extend the fused path to Observation and Condition, retire the row-based path
+
+Phase 1's gate passed decisively, so Phase 2 applied the same pattern to
+Observation (10 columns, including the polymorphic `valueQuantity`/
+`valueString` handling via a new `Float64ColumnBuilder`) and Condition (7
+columns), wired all three fused paths into actual production use
+(`ndjson_to_feather`/`ndjson_range_to_feather`), and retired the row-based
+path entirely: `PatientRow`/`ObservationRow`/`ConditionRow` (and
+`resources.mojo`, which held them, deleted outright),
+`shred_patient_fast`/`shred_observation_fast`/`shred_condition_fast`,
+`build_string_column`/`build_required_string_column`/
+`build_float64_column`/`build_bool_column`, and the `*_to_record_batch`/
+`*_to_feather` transpose functions — consistent with this project's
+established pattern of not carrying two parallel implementations forward
+once the new one is proven. `fast_shred.mojo` shrank from 669 to 484
+lines; `resources.mojo` disappeared entirely.
+
+Field-finding logic itself did not change — `shred_observation_fast_into_columns`/
+`shred_condition_fast_into_columns` reuse the exact same `_find_keys`/
+`_find_key`/`_coding0_at`/`_extract_number` primitives the retired
+row-based shredders used, only the destination of decoded values changed.
+`test_fhir_arrow.mojo` carries 31 tests: parity coverage ported from every
+case the retired `test_fast_shred.mojo` tests had for Observation and
+Condition (including the adversarial ones — escaped structural characters
+inside a skipped field, `code` key collisions, out-of-order keys with
+unrelated fields interspersed, multiple `coding[]` entries, a unicode
+escape inside a skipped field), plus dedicated column-alignment tests for
+both Observation and Condition specifically (more sibling-column surface
+than Patient's 6, especially around the polymorphic value[x] branch).
+Confirmed the alignment test actually catches the bug class it targets,
+the same way Phase 1's did: temporarily dropped the `value_string`
+null-append in the polymorphic branch, watched the suite fail with the
+exact expected mismatch, restored it.
+
+**Real numbers, same Synthea data, same machine** (two stable back-to-back
+runs after discarding one higher first run, same convention used
+throughout this benchmark history):
+
+| Resource | Pre-fusion (Phase G) | Fused (Phase 2) | Improvement | Python | Mojo vs Python |
+|---|---|---|---|---|---|
+| Patient (577 rows) | 4.887 ms | ~4.2 ms | ~14% faster | 35.2 ms | **Mojo ~8.4x faster** |
+| Observation (266,750 rows) | 1,659.6 ms | ~1,136 ms | **~31.6% faster** | 2,503.9 ms | **Mojo ~2.2x faster** |
+| Condition (19,025 rows) | 106.3 ms | ~67.8 ms | **~35.9% faster** | 152.6 ms | **Mojo ~2.25x faster** |
+
+Observation and Condition's gains are substantially larger than Patient's
+~14% — both resource types have more columns, more fields extracted per
+row, and (Observation especially) a much larger row count, so the
+per-field allocation this phase eliminates adds up more. This also
+resolves v2's thin, noise-adjacent 5-11% margin over Python on Observation
+and Condition (see above): the margin is now decisively 2.2x+, not a
+close call.
+
+A follow-up `sample`-based profiling pass (debug-symbol binary, 20s window,
+~1,026 samples, one full Patient+Observation+Condition run dominated
+time-wise by Observation) confirms the allocator-overhead reduction is not
+Patient-specific: allocator overhead dropped from Phase G's baseline
+**~24.0% to ~15.6%** of real work time on this Observation-heavy run — a
+smaller relative drop than Patient's 9.9%→4.7% (expected: Observation
+extracts more distinct fields per row, so the fused elimination applies to
+a larger, but proportionally similar, share of per-row work), with JSON
+scanning (~35.7%) and Arrow encoding (~14.0%) essentially flat versus
+Phase G, exactly as expected since neither of those was touched by this
+phase.
+
+Verified for real, not just at fixture scale: `pyarrow.feather.read_table()`
+against fresh output for all three resource types, every field compared
+directly against the source NDJSON (not just row counts) — 577 Patient
+rows, 266,750 Observation rows, 19,025 Condition rows, zero mismatches on
+any of the 5-7 shredded fields per resource type.
 
 ## Known limitations
 
