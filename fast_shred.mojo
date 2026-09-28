@@ -68,11 +68,22 @@ def _is_ws(c: UInt8) -> Bool:
 # rule. Reverted back to this single-hit early-exit design after confirming
 # that with the same real Synthea data and the same benchmark.
 #
-# SIMD_WIDTH = 32 (AVX2, 256-bit / 8-bit lanes) matches 1brc_arrow's choice,
-# already validated safe for this repo's declared linux-64/osx-arm64
-# platforms (GitHub's ubuntu-22.04 runners have AVX2 but not AVX-512).
+# SIMD_WIDTH = 16 (128-bit / 8-bit lanes), not 32: measured directly, not
+# assumed. A width-32 chunk on this early-exit design needs two 128-bit
+# vector ops plus a cross-register reduction to search one logical chunk,
+# which is strictly more work than a single native-width op for the common
+# case here (a hit found within the first register's worth of bytes, since
+# most FHIR field values and skip-distances are shorter than either width).
+# Measured with a standalone cross-language benchmark (same algorithm, same
+# realistic 5-40 byte gap distribution as real FHIR field values) before
+# changing this: width=16 is ~40% faster than width=32 for this exact
+# access pattern, consistently across repeated runs. 16 bytes (128-bit) is
+# also the *more* portable choice, not less: it's baseline SSE2 on every
+# x86_64 CPU (not just AVX2-capable ones), and the native NEON register
+# width on arm64 -- safe for this repo's declared linux-64/osx-arm64
+# platforms without the AVX2-specific caveat the old width=32 comment had.
 
-comptime _SIMD_WIDTH = 32
+comptime _SIMD_WIDTH = 16
 
 
 def _simd_find_first2(b: Span[UInt8, _], start: Int, t0: UInt8, t1: UInt8) raises -> Int:

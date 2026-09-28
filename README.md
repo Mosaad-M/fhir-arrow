@@ -729,6 +729,28 @@ directly against the source NDJSON (not just row counts) — 577 Patient
 rows, 266,750 Observation rows, 19,025 Condition rows, zero mismatches on
 any of the 5-7 shredded fields per resource type.
 
+### SIMD_WIDTH: 32 → 16, measured with a cross-language benchmark first
+
+`_skip_string`/`_skip_value`'s SIMD candidate search (`_SIMD_WIDTH`, used
+by both since Phase E) was 32 bytes, chosen to match `1brc_arrow`'s AVX2
+width. Building a standalone cross-language comparison (same early-exit
+search algorithm, realistic 5-40 byte field gaps, implemented natively in
+Mojo, C, Rust, and Zig, all verified against identical checksums) surfaced
+that this specific access pattern is faster at width=16 than width=32 —
+confirmed directly on this repo's own code, not just the standalone
+benchmark: ~40% faster in isolation, consistent across repeated runs.
+Width=16 is also the *more* portable choice, not less: it's baseline SSE2
+on every x86_64 CPU (not AVX2-specific like 32 was), and the native NEON
+register width on arm64.
+
+At the full pipeline level the real-world win is real but modest — Patient
+~flat, Observation ~3-4% faster, Condition trending faster but noisy
+across runs — much smaller than the isolated 40%, because this primitive
+is only one contributor within JSON scanning's ~44.5% share of total real
+work, not the whole of it. Reported honestly rather than extrapolated from
+the isolated number. Full test suite green, real pyarrow interop
+re-verified against fresh Patient output.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
