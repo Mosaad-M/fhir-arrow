@@ -393,47 +393,61 @@ def _extract_string(b: Span[UInt8, _], start: Int) raises -> String:
     return _extract_string_escaped(b, start)
 
 
-def _extract_string_escaped(b: Span[UInt8, _], start: Int) raises -> String:
-    """Byte-by-byte escape-decoding fallback for _extract_string, used once
-    a backslash has been seen. start must point at the opening quote."""
+def _decode_escaped_string_into(
+    b: Span[UInt8, _], start: Int, mut out: List[UInt8]
+) raises -> Int:
+    """Core of the escape-decoding fallback: appends decoded bytes directly
+    into the caller-supplied `out` buffer (extended, not replaced), so a
+    streaming column builder can decode straight into its own value buffer
+    without an intermediate String. Returns the index just past the closing
+    quote. start must point at the opening quote. Same escape table as
+    before this was factored out -- behavior-preserving, not a decode-logic
+    change."""
     var n = len(b)
     var i = start + 1
-    var result = List[UInt8](capacity=32)
     while i < n:
         var c = b[i]
         if c == _QUOTE:
-            return String(unsafe_from_utf8=result^)
+            return i + 1
         elif c == _BACKSLASH:
             i += 1
             if i >= n:
                 raise Error("fast_shred: _extract_string: unterminated escape")
             var esc = b[i]
             if esc == _QUOTE:
-                result.append(_QUOTE)
+                out.append(_QUOTE)
             elif esc == _BACKSLASH:
-                result.append(_BACKSLASH)
+                out.append(_BACKSLASH)
             elif esc == UInt8(ord("/")):
-                result.append(UInt8(ord("/")))
+                out.append(UInt8(ord("/")))
             elif esc == UInt8(ord("n")):
-                result.append(_LF)
+                out.append(_LF)
             elif esc == UInt8(ord("r")):
-                result.append(_CR)
+                out.append(_CR)
             elif esc == UInt8(ord("t")):
-                result.append(_TAB)
+                out.append(_TAB)
             elif esc == UInt8(ord("b")):
-                result.append(UInt8(8))
+                out.append(UInt8(8))
             elif esc == UInt8(ord("f")):
-                result.append(UInt8(12))
+                out.append(UInt8(12))
             elif esc == _LOWER_U:
                 i += 4  # skip 4 hex digits (i itself advances past 'u' below)
-                result.append(UInt8(ord("?")))
+                out.append(UInt8(ord("?")))
             else:
-                result.append(esc)
+                out.append(esc)
             i += 1
         else:
-            result.append(c)
+            out.append(c)
             i += 1
     raise Error("fast_shred: _extract_string: unterminated string starting at " + String(start))
+
+
+def _extract_string_escaped(b: Span[UInt8, _], start: Int) raises -> String:
+    """Byte-by-byte escape-decoding fallback for _extract_string, used once
+    a backslash has been seen. start must point at the opening quote."""
+    var result = List[UInt8](capacity=32)
+    _ = _decode_escaped_string_into(b, start, result)
+    return String(unsafe_from_utf8=result^)
 
 
 def _extract_number(b: Span[UInt8, _], start: Int) raises -> Float64:

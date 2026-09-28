@@ -4,8 +4,10 @@ from fhir_arrow import (
     ndjson_to_feather, ndjson_range_to_feather, merge_feathers,
     patients_to_record_batch, observations_to_record_batch,
     conditions_to_record_batch,
+    PatientColumns, shred_patient_fast_into_columns,
 )
 from resources import PatientRow, ObservationRow, ConditionRow
+from fast_shred import shred_patient_fast
 from arrow import (
     ArrowType, ArrowField, ArrowSchema, ArrowArray, RecordBatch,
     encode_arrow_file, decode_arrow_file,
@@ -416,6 +418,150 @@ def test_parallel_chunked_equivalent_to_sequential() raises:
             )
 
 
+# ── Phase 1: fused extraction-into-columns path (Patient only) ──────────────
+#
+# shred_patient_fast (the existing row-returning path) is the correctness
+# oracle here: every case below asserts the fused path produces exactly
+# the same decoded values on the same input.
+
+
+def test_fused_patient_parity_minimal() raises:
+    var line = String(
+        '{"resourceType": "Patient", "id": "p1", "gender": "female",'
+        ' "birthDate": "1990-01-01"}'
+    )
+    var oracle = shred_patient_fast(line.as_bytes())
+
+    var columns = PatientColumns()
+    shred_patient_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 1, "one row")
+
+    var id_col = batch.columns[0].copy()
+    var gender_col = batch.columns[1].copy()
+    var birth_col = batch.columns[2].copy()
+    var family_col = batch.columns[3].copy()
+    var given_col = batch.columns[4].copy()
+    var deceased_col = batch.columns[5].copy()
+
+    assert_eq_str(_get_utf8(id_col, 0), oracle.id, "id matches oracle")
+    assert_eq_str(_get_utf8(gender_col, 0), oracle.gender.value(), "gender matches oracle")
+    assert_eq_str(_get_utf8(birth_col, 0), oracle.birth_date.value(), "birth_date matches oracle")
+    assert_true(not _is_valid(family_col, 0), "family_name null, matches oracle")
+    assert_true(not _is_valid(given_col, 0), "given_name null, matches oracle")
+    assert_true(not _is_valid(deceased_col, 0), "deceased null, matches oracle")
+
+
+def test_fused_patient_parity_with_name() raises:
+    var line = String(
+        '{"id": "p2", "name": [{"family": "Smith", "given": ["Jane", "Q"]}]}'
+    )
+    var oracle = shred_patient_fast(line.as_bytes())
+
+    var columns = PatientColumns()
+    shred_patient_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var family_col = batch.columns[3].copy()
+    var given_col = batch.columns[4].copy()
+
+    assert_eq_str(_get_utf8(family_col, 0), oracle.family_name.value(), "family_name matches oracle")
+    assert_eq_str(_get_utf8(given_col, 0), oracle.given_name.value(), "given_name (first only) matches oracle")
+
+
+def test_fused_patient_parity_deceased_boolean() raises:
+    var line = String('{"id": "p3", "deceasedBoolean": true}')
+    var columns = PatientColumns()
+    shred_patient_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var deceased_col = batch.columns[5].copy()
+    assert_true(_is_valid(deceased_col, 0), "deceased present")
+    assert_true(_get_bool(deceased_col, 0) == True, "deceased true")
+
+
+def test_fused_patient_missing_id_raises() raises:
+    var line = String('{"gender": "male"}')
+    var columns = PatientColumns()
+    var raised = False
+    try:
+        shred_patient_fast_into_columns(line.as_bytes(), columns)
+    except:
+        raised = True
+    assert_true(raised, "missing id should raise, matching the row-based oracle")
+
+
+def test_fused_patient_parity_escaped_field() raises:
+    """Exercises append_json_string's escaped-fallback branch (backslash
+    seen before the closing quote), not just the bulk-extend fast path."""
+    var line = String(
+        '{"id": "p4", "name": [{"family": "O\\"Brien"}]}'
+    )
+    var oracle = shred_patient_fast(line.as_bytes())
+
+    var columns = PatientColumns()
+    shred_patient_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var family_col = batch.columns[3].copy()
+    assert_eq_str(_get_utf8(family_col, 0), oracle.family_name.value(), "escaped family_name matches oracle")
+    assert_true(_get_utf8(family_col, 0) == 'O"Brien', "escaped quote decoded correctly")
+
+
+def test_fused_patient_multi_row_column_alignment() raises:
+    """The one new correctness risk this design introduces: a missing
+    append/append_null call for one column would silently shift every
+    subsequent row in that column relative to the others. Three rows
+    with deliberately different null/present combinations per column --
+    if any single append call were dropped, at least one of these
+    cross-column checks would fail."""
+    var lines = List[String]()
+    lines.append(String('{"id": "r1", "gender": "female", "name": [{"family": "Alpha", "given": ["A"]}], "deceasedBoolean": false}'))
+    lines.append(String('{"id": "r2", "birthDate": "2000-01-01"}'))
+    lines.append(String('{"id": "r3", "gender": "male", "deceasedBoolean": true}'))
+
+    var columns = PatientColumns()
+    for i in range(len(lines)):
+        shred_patient_fast_into_columns(lines[i].as_bytes(), columns)
+    var batch = columns^.finish()
+    assert_eq_int(Int(batch.length), 3, "three rows")
+
+    var id_col = batch.columns[0].copy()
+    var gender_col = batch.columns[1].copy()
+    var birth_col = batch.columns[2].copy()
+    var family_col = batch.columns[3].copy()
+    var given_col = batch.columns[4].copy()
+    var deceased_col = batch.columns[5].copy()
+
+    assert_eq_str(_get_utf8(id_col, 0), "r1", "row 0 id")
+    assert_eq_str(_get_utf8(id_col, 1), "r2", "row 1 id")
+    assert_eq_str(_get_utf8(id_col, 2), "r3", "row 2 id")
+
+    assert_true(_is_valid(gender_col, 0), "row 0 gender present")
+    assert_eq_str(_get_utf8(gender_col, 0), "female", "row 0 gender value")
+    assert_true(not _is_valid(gender_col, 1), "row 1 gender null (misalignment would leak row 0/2's value here)")
+    assert_true(_is_valid(gender_col, 2), "row 2 gender present")
+    assert_eq_str(_get_utf8(gender_col, 2), "male", "row 2 gender value")
+
+    assert_true(not _is_valid(birth_col, 0), "row 0 birth_date null")
+    assert_true(_is_valid(birth_col, 1), "row 1 birth_date present")
+    assert_eq_str(_get_utf8(birth_col, 1), "2000-01-01", "row 1 birth_date value")
+    assert_true(not _is_valid(birth_col, 2), "row 2 birth_date null")
+
+    assert_true(_is_valid(family_col, 0), "row 0 family_name present")
+    assert_eq_str(_get_utf8(family_col, 0), "Alpha", "row 0 family_name value")
+    assert_true(not _is_valid(family_col, 1), "row 1 family_name null")
+    assert_true(not _is_valid(family_col, 2), "row 2 family_name null")
+
+    assert_true(_is_valid(given_col, 0), "row 0 given_name present")
+    assert_eq_str(_get_utf8(given_col, 0), "A", "row 0 given_name value")
+    assert_true(not _is_valid(given_col, 1), "row 1 given_name null")
+    assert_true(not _is_valid(given_col, 2), "row 2 given_name null")
+
+    assert_true(_is_valid(deceased_col, 0), "row 0 deceased present")
+    assert_true(_get_bool(deceased_col, 0) == False, "row 0 deceased false")
+    assert_true(not _is_valid(deceased_col, 1), "row 1 deceased null")
+    assert_true(_is_valid(deceased_col, 2), "row 2 deceased present")
+    assert_true(_get_bool(deceased_col, 2) == True, "row 2 deceased true")
+
+
 def main() raises:
     test_string_column_roundtrip_with_null()
     print("PASS test_string_column_roundtrip_with_null")
@@ -449,5 +595,23 @@ def main() raises:
 
     test_parallel_chunked_equivalent_to_sequential()
     print("PASS test_parallel_chunked_equivalent_to_sequential")
+
+    test_fused_patient_parity_minimal()
+    print("PASS test_fused_patient_parity_minimal")
+
+    test_fused_patient_parity_with_name()
+    print("PASS test_fused_patient_parity_with_name")
+
+    test_fused_patient_parity_deceased_boolean()
+    print("PASS test_fused_patient_parity_deceased_boolean")
+
+    test_fused_patient_missing_id_raises()
+    print("PASS test_fused_patient_missing_id_raises")
+
+    test_fused_patient_parity_escaped_field()
+    print("PASS test_fused_patient_parity_escaped_field")
+
+    test_fused_patient_multi_row_column_alignment()
+    print("PASS test_fused_patient_multi_row_column_alignment")
 
     print("\nAll fhir_arrow builder tests passed.")

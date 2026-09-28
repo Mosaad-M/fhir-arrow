@@ -15,6 +15,7 @@ from ndjson import read_ndjson_lines, read_ndjson_range
 from resources import PatientRow, ObservationRow, ConditionRow
 from fast_shred import (
     shred_patient_fast, shred_observation_fast, shred_condition_fast,
+    _find_keys, _first_array_element, _extract_bool, _decode_escaped_string_into,
 )
 
 
@@ -158,6 +159,233 @@ def build_bool_column(values: List[Optional[Bool]]) raises -> ArrowArray:
 
 
 # ── Patient: schema + RecordBatch assembly ───────────────────────────────────
+
+
+# ── Phase 1 prototype: fuse extraction with column-building (Patient only) ───
+#
+# The row-based path above (shred_patient_fast -> PatientRow -> into_parts()
+# -> build_string_column) still allocates one String per string field per
+# row during shredding, even after the transpose-copy fix removed the
+# second copy. This prototype writes decoded bytes directly into a
+# streaming Arrow column builder during the scan itself, skipping the
+# per-field String entirely for the common (escape-free) case. Kept
+# side-by-side with shred_patient_fast/patients_to_record_batch, which
+# stay untouched as the correctness oracle for this phase -- not wired
+# into ndjson_to_feather yet, pending the real-profiling gate check this
+# phase exists to run.
+
+comptime _FUSED_QUOTE = UInt8(34)      # '"'
+comptime _FUSED_BACKSLASH = UInt8(92)  # '\'
+
+
+struct StringColumnBuilder(Movable):
+    """Streaming Utf8 Arrow column builder. append_json_string appends
+    decoded bytes directly into this builder's own growing value buffer
+    during shredding -- no intermediate String is ever allocated for the
+    escape-free fast case (the common one), matching
+    fast_shred._extract_string's fast/escaped-fallback split but writing
+    straight into self.values instead of building a String only to have
+    build_string_column copy it again later. finish() produces the exact
+    ArrowArray shape build_string_column already produces, so nothing
+    downstream (schema, RecordBatch, encode_arrow_file) needs to change."""
+
+    var values: List[UInt8]
+    var offsets: List[UInt8]
+    var null_bits: List[Bool]
+    var length: Int
+    var null_count: Int
+
+    def __init__(out self):
+        self.values = List[UInt8]()
+        self.offsets = List[UInt8]()
+        for _ in range(4):
+            self.offsets.append(UInt8(0))  # offsets[0] = 0
+        self.null_bits = List[Bool]()
+        self.length = 0
+        self.null_count = 0
+
+    def _push_offset(mut self) raises:
+        for _ in range(4):
+            self.offsets.append(UInt8(0))
+        write_i32_le(self.offsets, len(self.offsets) - 4, Int32(len(self.values)))
+
+    def append_json_string(mut self, b: Span[UInt8, _], start: Int) raises:
+        """start must point at the opening quote of a JSON string value."""
+        var n = len(b)
+        var j = start + 1
+        while j < n:
+            var c = b[j]
+            if c == _FUSED_QUOTE:
+                self.values.extend(b[start + 1 : j])
+                self.null_bits.append(True)
+                self.length += 1
+                self._push_offset()
+                return
+            elif c == _FUSED_BACKSLASH:
+                _ = _decode_escaped_string_into(b, start, self.values)
+                self.null_bits.append(True)
+                self.length += 1
+                self._push_offset()
+                return
+            j += 1
+        raise Error("fhir_arrow: StringColumnBuilder: unterminated string")
+
+    def append_null(mut self) raises:
+        self.null_bits.append(False)
+        self.null_count += 1
+        self.length += 1
+        self._push_offset()
+
+    def finish(deinit self) raises -> ArrowArray:
+        var validity = List[UInt8]()
+        if self.null_count > 0:
+            validity = _pack_bits(self.null_bits)
+        return ArrowArray(
+            ArrowType.utf8(), self.length, self.null_count, validity, self.offsets^, self.values^
+        )
+
+
+struct BoolColumnBuilder(Movable):
+    """Streaming Bool Arrow column builder, same packed-bits shape
+    build_bool_column already produces."""
+
+    var null_bits: List[Bool]
+    var value_bits: List[Bool]
+    var length: Int
+    var null_count: Int
+
+    def __init__(out self):
+        self.null_bits = List[Bool]()
+        self.value_bits = List[Bool]()
+        self.length = 0
+        self.null_count = 0
+
+    def append(mut self, val: Bool) raises:
+        self.null_bits.append(True)
+        self.value_bits.append(val)
+        self.length += 1
+
+    def append_null(mut self) raises:
+        self.null_bits.append(False)
+        self.value_bits.append(False)
+        self.null_count += 1
+        self.length += 1
+
+    def finish(mut self) raises -> ArrowArray:
+        var validity = List[UInt8]()
+        if self.null_count > 0:
+            validity = _pack_bits(self.null_bits)
+        var value_bytes = _pack_bits(self.value_bits)
+        return ArrowArray(
+            ArrowType.bool_(), self.length, self.null_count, validity, List[UInt8](), value_bytes
+        )
+
+
+struct PatientColumns(Movable):
+    var id: StringColumnBuilder
+    var gender: StringColumnBuilder
+    var birth_date: StringColumnBuilder
+    var family_name: StringColumnBuilder
+    var given_name: StringColumnBuilder
+    var deceased: BoolColumnBuilder
+
+    def __init__(out self):
+        self.id = StringColumnBuilder()
+        self.gender = StringColumnBuilder()
+        self.birth_date = StringColumnBuilder()
+        self.family_name = StringColumnBuilder()
+        self.given_name = StringColumnBuilder()
+        self.deceased = BoolColumnBuilder()
+
+    def finish(deinit self) raises -> RecordBatch:
+        var n = self.id.length
+        var arrays = List[ArrowArray]()
+        arrays.append(self.id^.finish())
+        arrays.append(self.gender^.finish())
+        arrays.append(self.birth_date^.finish())
+        arrays.append(self.family_name^.finish())
+        arrays.append(self.given_name^.finish())
+        arrays.append(self.deceased.finish())
+        return RecordBatch(Int64(n), arrays)
+
+
+def shred_patient_fast_into_columns(
+    b: Span[UInt8, _], mut columns: PatientColumns
+) raises:
+    """Fused equivalent of fast_shred.shred_patient_fast: identical
+    field-finding logic (_find_keys/_first_array_element/_extract_bool,
+    unchanged), but appends decoded values directly into the passed-in
+    column builders instead of constructing a PatientRow. Every column
+    MUST get exactly one append/append_null call per invocation, in the
+    same fixed order every time -- a missing call silently misaligns
+    every subsequent row in that column relative to the others, which is
+    the one new correctness risk this design introduces (tested
+    explicitly in test_fhir_arrow.mojo, not just field-value checks)."""
+    var top_keys: List[String] = ["id", "gender", "birthDate", "name", "deceasedBoolean"]
+    var top = _find_keys(b, 0, top_keys)
+
+    if not top[0]:
+        raise Error("fhir_arrow: shred_patient_fast_into_columns: missing required field 'id'")
+    columns.id.append_json_string(b, top[0].value())
+
+    if top[1]:
+        columns.gender.append_json_string(b, top[1].value())
+    else:
+        columns.gender.append_null()
+
+    if top[2]:
+        columns.birth_date.append_json_string(b, top[2].value())
+    else:
+        columns.birth_date.append_null()
+
+    var family_appended = False
+    var given_appended = False
+    if top[3]:
+        var name0_start = _first_array_element(b, top[3].value())
+        if name0_start:
+            var name_keys: List[String] = ["family", "given"]
+            var name_fields = _find_keys(b, name0_start.value(), name_keys)
+            if name_fields[0]:
+                columns.family_name.append_json_string(b, name_fields[0].value())
+                family_appended = True
+            if name_fields[1]:
+                var given0_start = _first_array_element(b, name_fields[1].value())
+                if given0_start:
+                    columns.given_name.append_json_string(b, given0_start.value())
+                    given_appended = True
+    if not family_appended:
+        columns.family_name.append_null()
+    if not given_appended:
+        columns.given_name.append_null()
+
+    if top[4]:
+        columns.deceased.append(_extract_bool(b, top[4].value()))
+    else:
+        columns.deceased.append_null()
+
+
+def patients_to_feather_fused(ndjson_path: String, out_path: String) raises:
+    """Same output as patients_to_feather(shred_patient_fast(...)), but via
+    the fused columns-write path above. No .pop()/reverse dance needed --
+    lines are iterated in original order and appended directly in that
+    order, so there's no separate row-to-column transpose step left to
+    get backwards."""
+    var result = read_ndjson_lines(ndjson_path)
+    var content = result[0]
+    var spans = result[1].copy()
+    var b = content.as_bytes()
+
+    var columns = PatientColumns()
+    for i in range(len(spans)):
+        var span = spans[i]
+        shred_patient_fast_into_columns(b[span[0] : span[1]], columns)
+
+    var schema = patient_schema()
+    var batch = columns^.finish()
+    var batches = List[RecordBatch]()
+    batches.append(batch^)
+    var file_bytes = encode_arrow_file(schema, batches)
+    Path(out_path).write_bytes(file_bytes)
 
 
 def patient_schema() -> ArrowSchema:

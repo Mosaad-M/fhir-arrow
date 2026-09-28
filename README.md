@@ -594,6 +594,74 @@ real `patients.feather` from all 577 Synthea Patient records and compared
 every `id` value, in order, directly against the source NDJSON file — an
 exact match, not just "577 rows came back."
 
+### Phase H: fuse extraction with column-building — staged, gated on real profiling
+
+Phase G's honest finding pointed at `_extract_string`'s per-field
+allocation during shredding as the real remaining source of allocator
+overhead. The full fix is architectural — write decoded bytes directly
+into the Arrow column builder during the scan, instead of shredding into
+a row struct with heap-allocated `String` fields that get built once and
+then thrown away after `build_string_column` copies their bytes again.
+Given the previous two attempts at "this should obviously help" both
+underperformed the hypothesis (Phase F was a real regression, Phase G's
+predicted allocator win didn't materialize), this was staged and gated
+on real measurement rather than committed to all at once.
+
+**Phase 0** (quick, independent): `_extract_string`'s existing fast path
+still copied its result byte-by-byte in a loop despite its own docstring
+claiming a bulk copy — pre-sizing capacity avoided reallocation but not
+the per-element copy cost. Fixed with `result.extend(b[start+1:j])`
+(confirmed `List[UInt8].extend()` accepts a `Span[UInt8]` slice directly).
+All 61 existing tests pass unchanged. Benchmarked honestly: three runs on
+real data showed this within normal run-to-run noise at the pipeline
+level (Observation ranged 1554.7–1626.0ms across runs) — mechanically
+correct and worth keeping, but no measurable pipeline-level win on its
+own, consistent with the same small-string-optimization explanation from
+Phase G.
+
+**Phase 1** (the real test, Patient only): built `StringColumnBuilder`/
+`BoolColumnBuilder`/`PatientColumns` — streaming Arrow column builders
+that `shred_patient_fast_into_columns` appends directly into during the
+scan, reusing the exact same `_find_keys`/`_first_array_element`/
+`_extract_bool` field-finding logic as `shred_patient_fast` (only the
+destination of decoded values changes). The escape-decoding core was
+factored out of `_extract_string_escaped` into
+`_decode_escaped_string_into`, which writes into a caller-supplied buffer
+instead of always building a fresh `String` — reused by both the old
+row-based path (unchanged behavior, now a thin wrapper) and the new
+builder's escaped-value case. `shred_patient_fast`/`PatientRow` were left
+completely untouched as the correctness oracle for this phase — kept
+side-by-side, not wired into production `ndjson_to_feather` yet.
+
+New tests: parity checks against the row-based oracle for the minimal,
+name-present, deceased-boolean, missing-id, and escaped-character cases,
+plus a dedicated multi-row column-alignment test — the one new
+correctness risk this design introduces, since a missing `append`/
+`append_null` call for any single column would silently shift every
+subsequent row in that column relative to the others. Confirmed this
+test actually catches it: temporarily deleting one `append_null()` call
+made the suite fail immediately with the exact expected mismatch,
+restoring it made everything pass again. Also confirmed via real
+`pyarrow`: `t_old.equals(t_new)` on all 577 real Synthea Patient rows —
+`True`, byte-for-byte table equality between the old and fused paths, not
+just "same row count."
+
+**Real numbers, this time actually validating the hypothesis**:
+- Wall-clock (30-iteration average, real Patient data): 3.94ms → 3.37ms
+  (**~14% faster**).
+- The gate — a second `sample`-based profiling pass, old vs. fused,
+  30x3000 iterations each for enough samples: allocator overhead
+  **9.9% → 4.7% of real work time — roughly halved**, not just
+  unchanged-within-noise the way Phase G's identical mechanism-check
+  came back. This is the first of the three "reduce allocation" attempts
+  this session where the profiler actually confirms the predicted
+  mechanism, not just a wall-clock number moving the right direction.
+
+**Not yet done**: Phase 1 deliberately stops at Patient only, per the
+plan's staging — Observation and Condition (the bigger payoff, since
+Observation dominates total pipeline time) are a separate decision point,
+along with retiring the row-based shredders once all three are proven.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
