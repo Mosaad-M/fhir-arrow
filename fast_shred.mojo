@@ -370,8 +370,10 @@ def _extract_string(b: Span[UInt8, _], start: Int) raises -> String:
     Fast path: most FHIR field values (ids, LOINC codes, ISO dates) never
     contain an escape. Scan for the closing quote checking only for a
     backslash; if none is seen, the string's exact length is already known
-    (no escapes means byte count == char count), so the result buffer is
-    pre-sized once and bulk-copied in a second pass, instead of growing via
+    (no escapes means byte count == char count), so the result is built
+    with a single bulk `List.extend()` of the source slice (confirmed
+    `List[UInt8].extend()` accepts a `Span[UInt8]` slice directly, no
+    intermediate `List` conversion needed) instead of growing via
     `.append()` on every byte the way the escape-handling loop below has
     to. Falls back to the byte-by-byte escape-decoding loop the moment a
     backslash is seen (same output as before this fast path existed — this
@@ -383,8 +385,7 @@ def _extract_string(b: Span[UInt8, _], start: Int) raises -> String:
         if c == _QUOTE:
             var length = j - (start + 1)
             var result = List[UInt8](capacity=length)
-            for k in range(start + 1, j):
-                result.append(b[k])
+            result.extend(b[start + 1 : j])
             return String(unsafe_from_utf8=result^)
         elif c == _BACKSLASH:
             break
