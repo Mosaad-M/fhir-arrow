@@ -120,6 +120,17 @@ struct StringColumnBuilder(Movable):
         self.length += 1
         self._push_offset()
 
+    def append_raw(mut self, b: Span[UInt8, _]) raises:
+        """Appends `b` verbatim, byte-for-byte, with NO JSON-escape
+        decoding -- unlike append_json_string, this is for a full raw
+        record (raw_json), where decoding would be meaningless across the
+        whole object's structural quotes/braces, not just a single
+        field's value."""
+        self.values.extend(b)
+        self.null_bits.append(True)
+        self.length += 1
+        self._push_offset()
+
     def finish(deinit self) raises -> ArrowArray:
         var validity = List[UInt8]()
         if self.null_count > 0:
@@ -215,6 +226,7 @@ struct PatientColumns(Movable):
     var family_name: StringColumnBuilder
     var given_name: StringColumnBuilder
     var deceased: BoolColumnBuilder
+    var raw_json: StringColumnBuilder
 
     def __init__(out self):
         self.id = StringColumnBuilder()
@@ -223,6 +235,7 @@ struct PatientColumns(Movable):
         self.family_name = StringColumnBuilder()
         self.given_name = StringColumnBuilder()
         self.deceased = BoolColumnBuilder()
+        self.raw_json = StringColumnBuilder()
 
     def finish(deinit self) raises -> RecordBatch:
         var n = self.id.length
@@ -233,6 +246,7 @@ struct PatientColumns(Movable):
         arrays.append(self.family_name^.finish())
         arrays.append(self.given_name^.finish())
         arrays.append(self.deceased.finish())
+        arrays.append(self.raw_json^.finish())
         return RecordBatch(Int64(n), arrays)
 
 
@@ -291,6 +305,8 @@ def shred_patient_fast_into_columns(
     else:
         columns.deceased.append_null()
 
+    columns.raw_json.append_raw(b)
+
 
 def patient_schema() -> ArrowSchema:
     var fields = List[ArrowField]()
@@ -300,6 +316,7 @@ def patient_schema() -> ArrowSchema:
     fields.append(ArrowField("family_name", ArrowType.utf8(), True))
     fields.append(ArrowField("given_name", ArrowType.utf8(), True))
     fields.append(ArrowField("deceased", ArrowType.bool_(), True))
+    fields.append(ArrowField("raw_json", ArrowType.utf8(), False))
     return ArrowSchema(fields, Int16(0))
 
 
@@ -317,6 +334,7 @@ struct ObservationColumns(Movable):
     var value_quantity: Float64ColumnBuilder
     var value_unit: StringColumnBuilder
     var value_string: StringColumnBuilder
+    var raw_json: StringColumnBuilder
 
     def __init__(out self):
         self.id = StringColumnBuilder()
@@ -329,6 +347,7 @@ struct ObservationColumns(Movable):
         self.value_quantity = Float64ColumnBuilder()
         self.value_unit = StringColumnBuilder()
         self.value_string = StringColumnBuilder()
+        self.raw_json = StringColumnBuilder()
 
     def finish(deinit self) raises -> RecordBatch:
         var n = self.id.length
@@ -343,6 +362,7 @@ struct ObservationColumns(Movable):
         arrays.append(self.value_quantity.finish())
         arrays.append(self.value_unit^.finish())
         arrays.append(self.value_string^.finish())
+        arrays.append(self.raw_json^.finish())
         return RecordBatch(Int64(n), arrays)
 
 
@@ -426,6 +446,8 @@ def shred_observation_fast_into_columns(
     if not vs_appended:
         columns.value_string.append_null()
 
+    columns.raw_json.append_raw(b)
+
 
 def observation_schema() -> ArrowSchema:
     var fields = List[ArrowField]()
@@ -439,6 +461,7 @@ def observation_schema() -> ArrowSchema:
     fields.append(ArrowField("value_quantity", ArrowType.float_(2), True))
     fields.append(ArrowField("value_unit", ArrowType.utf8(), True))
     fields.append(ArrowField("value_string", ArrowType.utf8(), True))
+    fields.append(ArrowField("raw_json", ArrowType.utf8(), False))
     return ArrowSchema(fields, Int16(0))
 
 
@@ -453,6 +476,7 @@ struct ConditionColumns(Movable):
     var clinical_status: StringColumnBuilder
     var onset_datetime: StringColumnBuilder
     var recorded_date: StringColumnBuilder
+    var raw_json: StringColumnBuilder
 
     def __init__(out self):
         self.id = StringColumnBuilder()
@@ -462,6 +486,7 @@ struct ConditionColumns(Movable):
         self.clinical_status = StringColumnBuilder()
         self.onset_datetime = StringColumnBuilder()
         self.recorded_date = StringColumnBuilder()
+        self.raw_json = StringColumnBuilder()
 
     def finish(deinit self) raises -> RecordBatch:
         var n = self.id.length
@@ -473,6 +498,7 @@ struct ConditionColumns(Movable):
         arrays.append(self.clinical_status^.finish())
         arrays.append(self.onset_datetime^.finish())
         arrays.append(self.recorded_date^.finish())
+        arrays.append(self.raw_json^.finish())
         return RecordBatch(Int64(n), arrays)
 
 
@@ -540,6 +566,8 @@ def shred_condition_fast_into_columns(
     else:
         columns.recorded_date.append_null()
 
+    columns.raw_json.append_raw(b)
+
 
 def condition_schema() -> ArrowSchema:
     var fields = List[ArrowField]()
@@ -550,6 +578,7 @@ def condition_schema() -> ArrowSchema:
     fields.append(ArrowField("clinical_status", ArrowType.utf8(), True))
     fields.append(ArrowField("onset_datetime", ArrowType.utf8(), True))
     fields.append(ArrowField("recorded_date", ArrowType.utf8(), True))
+    fields.append(ArrowField("raw_json", ArrowType.utf8(), False))
     return ArrowSchema(fields, Int16(0))
 
 

@@ -126,6 +126,7 @@ known schema, not a general-purpose FHIR parser.
 | `family_name` | `name[0].family` | first `name` entry only |
 | `given_name` | `name[0].given[0]` | first given name of the first `name` entry only |
 | `deceased` | `deceasedBoolean` | `deceasedDateTime` is **out of scope**, left null |
+| `raw_json` | the entire original resource | verbatim, not run through JSON-escape decoding -- see "Extra fields" below |
 
 ### Observation
 
@@ -138,6 +139,7 @@ known schema, not a general-purpose FHIR parser.
 | `effective_datetime` | `effectiveDateTime` | |
 | `value_quantity` / `value_unit` | `valueQuantity.{value,unit}` | one of two `value[x]` variants handled |
 | `value_string` | `valueString` | the other handled variant |
+| `raw_json` | the entire original resource | same as Patient's `raw_json` -- see "Extra fields" below |
 
 `value[x]` variants other than `valueQuantity`/`valueString` (e.g.
 `valueCodeableConcept`) are **out of scope** for v0: both value columns are
@@ -155,6 +157,31 @@ arrays, which is the part worth showing off.
 | `clinical_status` | `clinicalStatus.coding[0].code` | |
 | `onset_datetime` | `onsetDateTime` | other `onset[x]` variants (e.g. `onsetAge`) are **out of scope**, left null |
 | `recorded_date` | `recordedDate` | |
+| `raw_json` | the entire original resource | same as Patient's `raw_json` -- see "Extra fields" below |
+
+### Extra fields: `raw_json`
+
+Only the fields listed above are individually shredded into their own
+typed columns. Everything else in a resource (`meta`, `text`, `extension`,
+`identifier`, `telecom`, `category`, `encounter`, `performer`,
+`referenceRange`, and every other FHIR field this v0 schema doesn't model)
+is not modeled at all -- but it isn't silently lost either: `raw_json`
+carries the complete, unmodified original resource JSON object, giving
+downstream consumers a fallback to parse further themselves without this
+project needing to model every possible field. It is **not** run through
+JSON-escape decoding, since decoding is only meaningful within a single
+field's value, not across a whole object whose own structural `"`/`{`/`}`
+characters must survive unmodified -- mirrors hl7-arrow's `raw_message`
+column exactly, one resource per row here rather than one message per
+`\r`-delimited group of segments.
+
+Unlike hl7-arrow's Observations table (which duplicates the raw message
+once per OBX row within a message), there is no such duplication here:
+Bulk FHIR NDJSON is already one full resource object per line, so
+`raw_json` is exactly the source line each shredder already receives, no
+new span computation and no per-row-scoped subsetting needed. This is a
+real, non-free addition -- see "`raw_json`: extra-fields passthrough" in
+Benchmark below for the measured cost and verification.
 
 ## Benchmark
 
@@ -751,6 +778,55 @@ work, not the whole of it. Reported honestly rather than extrapolated from
 the isolated number. Full test suite green, real pyarrow interop
 re-verified against fresh Patient output.
 
+### `raw_json`: extra-fields passthrough
+
+Closes the "everything else in a resource is dropped" gap named in Known
+limitations, mirroring hl7-arrow's already-proven `raw_message` design: a
+new `StringColumnBuilder.append_raw(b)` (bulk `.extend()`, no
+JSON-escape decoding) appends each resource's full source line verbatim
+as the last column on all three tables. Confirmed simpler here than in
+hl7-arrow: Bulk FHIR NDJSON is already exactly one resource object per
+line (`find_line_spans` in `ndjson.mojo`), so `raw_json` is just the same
+`b` span each `shred_*_fast_into_columns` function already receives — no
+new span computation, and (unlike hl7-arrow's Observations table) no
+per-row duplication concern either, since it's already one resource per
+row.
+
+Confirmed the column-alignment risk applies here too, same as every other
+column this project has added: temporarily dropped the Patient
+`raw_json.append_raw(b)` call and confirmed the suite crashes (an
+out-of-bounds read against the now-misaligned offsets), then restored it.
+9 new tests (33 total in `test_fhir_arrow.mojo`): per-resource-type
+byte-verbatim checks (an escaped quote inside a shredded field survives
+un-decoded in `raw_json`, and a key this schema doesn't otherwise shred,
+e.g. `resourceType`/`meta`/`encounter`, is preserved), plus `raw_json`
+assertions folded into each resource type's existing column-alignment
+test.
+
+**Real, accepted cost, measured directly via `git stash` on the same
+regenerated Synthea dataset (562 Patient / 296,901 Observation / 19,571
+Condition rows), before/after, same machine:**
+
+| Resource | Before `raw_json` | After `raw_json` |
+|---|---|---|
+| Patient | ~3.2 ms | ~8.5 ms |
+| Observation | ~948 ms | ~1,853 ms |
+| Condition | ~49 ms | ~105 ms |
+
+Roughly **doubles** wall-clock time across all three resource types --
+larger than "a small per-row cost." Root cause: for most of these
+resources, the full JSON object (every field this project doesn't
+otherwise shred included) is comparable to or larger than the handful of
+scalar bytes previously extracted, so copying it in full roughly doubles
+the bytes actually written per row. That's the real, measured price of
+"one column, full text, no per-field modeling," reported plainly rather
+than as a rounded-down "small" cost. Verified byte-for-byte: real
+`pyarrow.feather.read_table()` reads `raw_json` back and it matches the
+source NDJSON line exactly, zero mismatches across all 562 Patient /
+296,901 Observation / 19,571 Condition rows -- genuinely new verification
+for this project, since neither fhir-arrow nor hl7-arrow had a
+pyarrow-level fidelity check for a raw/verbatim column before this.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
@@ -764,8 +840,11 @@ re-verified against fresh Patient output.
   `Block.bodyLength` being computed from the wrong reference point. None
   of that code lived in this repo; bump the `arrow` dependency to pick up
   the fix.
-- Only the fields listed above are shredded; everything else in a resource
-  is dropped, not preserved in an "extra fields" column.
+- Only the fields listed above are individually shredded into typed
+  columns; everything else is only available via the raw `raw_json`
+  passthrough (see "Extra fields" above), not its own structured column --
+  and that passthrough has a real, measured cost (roughly doubles
+  wall-clock time per resource type), not a free addition.
 - `id` is the only field treated as required; every other field's absence
   is a null in that row, not an error.
 - No streaming on the sequential path: `read_ndjson_lines` loads the whole

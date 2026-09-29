@@ -161,7 +161,7 @@ def test_ndjson_to_feather_patient_end_to_end() raises:
     var result = decode_arrow_file(file_bytes)
     var schema = result[0].copy()
     var batches = result[1].copy()
-    assert_eq_int(len(schema.fields), 6, "column count")
+    assert_eq_int(len(schema.fields), 7, "column count")
     assert_eq_int(Int(batches[0].length), 3, "row count")
 
     var id_col = batches[0].columns[0].copy()
@@ -508,6 +508,30 @@ def test_fused_patient_parity_escaped_field() raises:
     assert_eq_str(_get_utf8(family_col, 0), 'O"Brien', "escaped quote decoded correctly")
 
 
+def test_fused_patient_raw_json_is_verbatim() raises:
+    """Raw_json holds the source line VERBATIM -- an escaped quote inside
+    a shredded field must NOT be decoded in raw_json (unlike family_name
+    itself), and raw_json must equal the exact source bytes, including
+    keys this repo doesn't otherwise shred (e.g. resourceType)."""
+    var line = String(
+        '{"resourceType": "Patient", "id": "p5",'
+        ' "name": [{"family": "O\\"Brien"}], "gender": "female"}'
+    )
+    var columns = PatientColumns()
+    shred_patient_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var raw_col = batch.columns[6].copy()
+    assert_eq_str(_get_utf8(raw_col, 0), line, "raw_json is byte-for-byte verbatim")
+    assert_true(
+        _get_utf8(raw_col, 0).find('O\\"Brien') >= 0,
+        "escaped quote left un-decoded in raw_json",
+    )
+    assert_true(
+        _get_utf8(raw_col, 0).find("resourceType") >= 0,
+        "raw_json preserves a key this repo doesn't otherwise shred",
+    )
+
+
 def test_fused_patient_multi_row_column_alignment() raises:
     """The one new correctness risk this design introduces: a missing
     append/append_null call for one column would silently shift every
@@ -532,6 +556,7 @@ def test_fused_patient_multi_row_column_alignment() raises:
     var family_col = batch.columns[3].copy()
     var given_col = batch.columns[4].copy()
     var deceased_col = batch.columns[5].copy()
+    var raw_col = batch.columns[6].copy()
 
     assert_eq_str(_get_utf8(id_col, 0), "r1", "row 0 id")
     assert_eq_str(_get_utf8(id_col, 1), "r2", "row 1 id")
@@ -563,6 +588,10 @@ def test_fused_patient_multi_row_column_alignment() raises:
     assert_true(not _is_valid(deceased_col, 1), "row 1 deceased null")
     assert_true(_is_valid(deceased_col, 2), "row 2 deceased present")
     assert_true(_get_bool(deceased_col, 2) == True, "row 2 deceased true")
+
+    assert_eq_str(_get_utf8(raw_col, 0), lines[0], "row 0 raw_json matches source line (misalignment would leak here too)")
+    assert_eq_str(_get_utf8(raw_col, 1), lines[1], "row 1 raw_json matches source line")
+    assert_eq_str(_get_utf8(raw_col, 2), lines[2], "row 2 raw_json matches source line")
 
 
 # ── Fused extraction-into-columns: Observation ────────────────────────────────
@@ -729,6 +758,24 @@ def test_fused_observation_multiple_coding_entries() raises:
     assert_eq_str(_get_utf8(display_col, 0), "First Code", "only the first coding entry should be read")
 
 
+def test_fused_observation_raw_json_is_verbatim() raises:
+    """Raw_json holds the source line VERBATIM, including keys this repo
+    doesn't otherwise shred (e.g. meta, category)."""
+    var line = String(
+        '{"resourceType": "Observation", "meta": {"versionId": "1"},'
+        ' "id": "o8", "status": "final"}'
+    )
+    var columns = ObservationColumns()
+    shred_observation_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var raw_col = batch.columns[10].copy()
+    assert_eq_str(_get_utf8(raw_col, 0), line, "raw_json is byte-for-byte verbatim")
+    assert_true(
+        _get_utf8(raw_col, 0).find("meta") >= 0,
+        "raw_json preserves a key this repo doesn't otherwise shred",
+    )
+
+
 def test_fused_observation_multi_row_column_alignment() raises:
     """Same alignment risk as Patient's version, but for Observation's 10
     columns -- more sibling-column surface, and specifically exercises the
@@ -752,6 +799,7 @@ def test_fused_observation_multi_row_column_alignment() raises:
     var vq_col = batch.columns[7].copy()
     var vu_col = batch.columns[8].copy()
     var vs_col = batch.columns[9].copy()
+    var raw_col = batch.columns[10].copy()
 
     assert_eq_str(_get_utf8(id_col, 0), "r1", "row 0 id")
     assert_eq_str(_get_utf8(id_col, 1), "r2", "row 1 id")
@@ -789,6 +837,10 @@ def test_fused_observation_multi_row_column_alignment() raises:
     assert_true(not _is_valid(eff_col, 0), "row 0 effective_datetime null")
     assert_true(not _is_valid(eff_col, 1), "row 1 effective_datetime null")
 
+    assert_eq_str(_get_utf8(raw_col, 0), lines[0], "row 0 raw_json matches source line (misalignment would leak here too)")
+    assert_eq_str(_get_utf8(raw_col, 1), lines[1], "row 1 raw_json matches source line")
+    assert_eq_str(_get_utf8(raw_col, 2), lines[2], "row 2 raw_json matches source line")
+
 
 # ── Fused extraction-into-columns: Condition ──────────────────────────────────
 #
@@ -823,6 +875,24 @@ def test_fused_condition_full() raises:
     assert_eq_str(_get_utf8(status_col, 0), "active", "clinical_status")
     assert_eq_str(_get_utf8(onset_col, 0), "2020-05-01", "onset_datetime")
     assert_eq_str(_get_utf8(recorded_col, 0), "2020-05-02", "recorded_date")
+
+
+def test_fused_condition_raw_json_is_verbatim() raises:
+    """Raw_json holds the source line VERBATIM, including keys this repo
+    doesn't otherwise shred (e.g. encounter)."""
+    var line = String(
+        '{"id": "c4", "encounter": {"reference": "Encounter/e1"},'
+        ' "code": {"coding": [{"code": "44054006"}]}}'
+    )
+    var columns = ConditionColumns()
+    shred_condition_fast_into_columns(line.as_bytes(), columns)
+    var batch = columns^.finish()
+    var raw_col = batch.columns[7].copy()
+    assert_eq_str(_get_utf8(raw_col, 0), line, "raw_json is byte-for-byte verbatim")
+    assert_true(
+        _get_utf8(raw_col, 0).find("encounter") >= 0,
+        "raw_json preserves a key this repo doesn't otherwise shred",
+    )
 
 
 def test_fused_condition_no_onset() raises:
@@ -885,6 +955,7 @@ def test_fused_condition_multi_row_column_alignment() raises:
     var status_col = batch.columns[4].copy()
     var onset_col = batch.columns[5].copy()
     var recorded_col = batch.columns[6].copy()
+    var raw_col = batch.columns[7].copy()
 
     assert_eq_str(_get_utf8(id_col, 0), "r1", "row 0 id")
     assert_eq_str(_get_utf8(id_col, 1), "r2", "row 1 id")
@@ -916,6 +987,10 @@ def test_fused_condition_multi_row_column_alignment() raises:
     assert_eq_str(_get_utf8(onset_col, 2), "2023-03-03", "row 2 onset_datetime value")
     assert_true(not _is_valid(onset_col, 0), "row 0 onset_datetime null")
     assert_true(not _is_valid(onset_col, 1), "row 1 onset_datetime null")
+
+    assert_eq_str(_get_utf8(raw_col, 0), lines[0], "row 0 raw_json matches source line (misalignment would leak here too)")
+    assert_eq_str(_get_utf8(raw_col, 1), lines[1], "row 1 raw_json matches source line")
+    assert_eq_str(_get_utf8(raw_col, 2), lines[2], "row 2 raw_json matches source line")
 
 
 def main() raises:
@@ -967,6 +1042,9 @@ def main() raises:
     test_fused_patient_parity_escaped_field()
     print("PASS test_fused_patient_parity_escaped_field")
 
+    test_fused_patient_raw_json_is_verbatim()
+    print("PASS test_fused_patient_raw_json_is_verbatim")
+
     test_fused_patient_multi_row_column_alignment()
     print("PASS test_fused_patient_multi_row_column_alignment")
 
@@ -994,11 +1072,17 @@ def main() raises:
     test_fused_observation_multiple_coding_entries()
     print("PASS test_fused_observation_multiple_coding_entries")
 
+    test_fused_observation_raw_json_is_verbatim()
+    print("PASS test_fused_observation_raw_json_is_verbatim")
+
     test_fused_observation_multi_row_column_alignment()
     print("PASS test_fused_observation_multi_row_column_alignment")
 
     test_fused_condition_full()
     print("PASS test_fused_condition_full")
+
+    test_fused_condition_raw_json_is_verbatim()
+    print("PASS test_fused_condition_raw_json_is_verbatim")
 
     test_fused_condition_no_onset()
     print("PASS test_fused_condition_no_onset")
