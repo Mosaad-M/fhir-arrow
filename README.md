@@ -618,6 +618,13 @@ copy must be a malloc") still needs to be checked against a second
 profiling pass, not assumed correct just because the fix compiled and
 the wall-clock number moved in the right direction.
 
+**Correction (see "Root-causing the 'allocator overhead' bucket" below,
+a later session)**: the `_extract_string` guess above was already stale
+by the time it was checked -- Phase 2 (later in this same document)
+retired the entire code path that called it. Re-profiling the current
+pipeline found a real, different, much larger issue instead: a stale
+`arrow` dependency version.
+
 Verified for real, not just via the fixture-scale unit tests: generated a
 real `patients.feather` from all 577 Synthea Patient records and compared
 every `id` value, in order, directly against the source NDJSON file — an
@@ -827,6 +834,61 @@ source NDJSON line exactly, zero mismatches across all 562 Patient /
 for this project, since neither fhir-arrow nor hl7-arrow had a
 pyarrow-level fidelity check for a raw/verbatim column before this.
 
+### Root-causing the "allocator overhead" bucket: a stale dependency, not `_extract_string`
+
+The 24%→15.6% "allocator overhead" profiling bucket left unexplained back
+at Phase G/Phase 2 was guessed to most likely be the original
+`_extract_string` calls during shredding. That guess was already stale by
+the time it was investigated further: Phase 2 (same session, earlier)
+retired the entire row-based shredding path, and `_extract_string` is now
+called from nowhere in production (`grep` confirms it — only
+`test_fast_shred.mojo` still calls it directly). **Lesson applied, not
+just stated**: didn't trust the old hypothesis, re-profiled the CURRENT
+pipeline from scratch instead of chasing dead code.
+
+A fresh `sample`-based profile (debug-symbol binary, 6-7 iterations over
+the real 296,901-row Observation file, ~5,100-6,100 real work samples)
+found something unrelated to allocator overhead at all: **`arrow.mojo`
+itself accounted for ~46.8% of all real work** (`arrow.mojo:100` inside
+`encode_ipc_message`'s body-byte-copy loop, `arrow.mojo:1141` inside
+`decode_ipc_message` as called from `encode_arrow_file`'s footer-Block
+construction). Root cause: this repo's `arrow` dependency was still
+pinned to `>=1.1.2`, resolving to **1.1.3** -- which predates the
+byte-by-byte IPC copy-loop fix that landed in `arrow` v1.2.1 during a
+completely different investigation on hl7-arrow, this same session. Once
+`raw_json` pushed this repo's own payload sizes into the same regime that
+originally exposed that bug on hl7-arrow, the exact same latent
+inefficiency became dominant here too -- a live example of the
+`arrow`-side lesson stated back when that bug was first found: "a shared
+dependency's own benchmarks are not sufficient evidence a hot path is
+fast enough for every consumer," now proven true for a *second*,
+independent consumer of the same dependency.
+
+**Fix required zero new engineering** -- the bug was already found and
+fixed upstream; this repo just hadn't picked up the release. Bumped the
+`arrow` constraint to `>=1.2.2` (`mojo-pkg update`, `1.1.3 -> 1.2.2`).
+Full suite green (`ndjson`/`fast_shred`/`fhir_arrow`, 33+ tests), real
+pyarrow interop re-verified with zero mismatches across all rows.
+
+**Real numbers, before/after, same regenerated Synthea dataset:**
+
+| Resource | Before (arrow 1.1.3) | After (arrow 1.2.2) | Improvement |
+|---|---|---|---|
+| Patient | ~8.5 ms | ~6.1 ms | ~28% faster |
+| Observation | ~1,853 ms | ~1,498 ms | ~19% faster |
+| Condition | ~105 ms | ~75 ms | ~28% faster |
+
+A follow-up profiling pass confirmed the mechanism directly, not just the
+wall-clock number: `arrow.mojo`'s real contribution dropped from ~46.8%
+to effectively **0%** (1 sample out of 5,142). What remains in the
+profile now is legitimate, expected work with no single dominant
+bottleneck -- `List.extend`'s inner copy loop (buffer growth, partly from
+`raw_json`'s own bulk copies), `_skip_string`'s SIMD candidate scan (JSON
+scanning, skipping fields this schema doesn't shred), the NDJSON file
+read itself, and the shred call site -- the same shape of "real work,
+properly distributed" outcome hl7-arrow's own profiling settled into
+after its equivalent fix.
+
 ## Known limitations
 
 - **Real `pyarrow`/DuckDB/Polars can now open the `.feather` files this
@@ -864,7 +926,7 @@ pyarrow-level fidelity check for a raw/verbatim column before this.
 
 ## Dependencies
 
-- [arrow](https://github.com/Mosaad-M/arrow) `>=1.1.2`: pure-Mojo Arrow IPC
+- [arrow](https://github.com/Mosaad-M/arrow) `>=1.2.2`: pure-Mojo Arrow IPC
   encoder/decoder (pulls in `flatbuffers` transitively)
 
 No `max` dependency: Phase D's parallel path investigated
