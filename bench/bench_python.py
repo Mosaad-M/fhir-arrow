@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Python baseline for the fhir-arrow benchmark.
 
-Mirrors exactly the same v0 field-shredding scope as resources.mojo (see the
-README's field-mapping table) so the comparison is apples to apples: same
-input files, same fields extracted, same output format (Feather). Uses the
-"typical" approach a data engineer would actually reach for (plain `json` +
-`pandas`/`pyarrow`), not a heavier FHIR-validating library like
-`fhir.resources`, since that does meaningfully more work (schema
-validation) than this benchmark is measuring.
+Mirrors exactly the same field-shredding scope as fhir_arrow.mojo (see the
+README's field-mapping table, including the raw_json passthrough column)
+so the comparison is apples to apples: same input files, same fields
+extracted, same output format (Feather). Uses the "typical" approach a
+data engineer would actually reach for (plain `json` + `pandas`/`pyarrow`),
+not a heavier FHIR-validating library like `fhir.resources`, since that
+does meaningfully more work (schema validation) than this benchmark is
+measuring.
 
 Usage: python3 bench_python.py <synthea_fhir_dir> <out_dir>
 """
@@ -94,7 +95,9 @@ def run_one(label, ndjson_path, out_path, shredder):
             if not line:
                 continue
             obj = json.loads(line)
-            rows.append(shredder(obj))
+            row = shredder(obj)
+            row["raw_json"] = line
+            rows.append(row)
     df = pd.DataFrame(rows)
     df.to_feather(out_path)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
