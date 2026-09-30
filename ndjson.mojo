@@ -21,9 +21,6 @@
 # scan here again without re-benchmarking against find() first.
 
 
-from std.pathlib import Path
-
-
 def find_line_spans(content: String) raises -> List[Tuple[Int, Int]]:
     """Scan `content` for '\\n'-delimited line boundaries, skipping
     zero-length (blank) lines. Returns (start, end) byte-offset pairs into
@@ -46,7 +43,14 @@ def find_line_spans(content: String) raises -> List[Tuple[Int, Int]]:
 def read_ndjson_lines(path: String) raises -> Tuple[String, List[Tuple[Int, Int]]]:
     """Read an NDJSON file once. Returns (content, spans), one span per
     non-blank line, in order. Raises if the file has no non-blank lines."""
-    var content = Path(path).read_text()
+    # Sized read, not Path.read_text(): an unsized read grows its buffer as
+    # it goes and peaks at several times the file size; reading exactly the
+    # file's size peaks at 2x only transiently, leaving 1x resident.
+    var f = open(path, "r")
+    var size = Int(f.seek(0, 2))
+    _ = f.seek(0)
+    var content = f.read(size)
+    f.close()
     var spans = find_line_spans(content)
 
     if len(spans) == 0:
