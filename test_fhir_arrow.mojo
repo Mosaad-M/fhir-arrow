@@ -93,7 +93,7 @@ def test_string_column_roundtrip_with_null() raises:
 
     var arrays = List[ArrowArray]()
     arrays.append(arr.copy())
-    var batch = RecordBatch(Int64(3), arrays)
+    var batch = RecordBatch(Int64(3), arrays.copy())
     var batches = List[RecordBatch]()
     batches.append(batch.copy())
 
@@ -127,9 +127,9 @@ def test_float64_and_bool_columns_roundtrip_with_nulls() raises:
     var schema = ArrowSchema(fields, Int16(0))
 
     var arrays = List[ArrowArray]()
-    arrays.append(float_builder.finish())
-    arrays.append(bool_builder.finish())
-    var batch = RecordBatch(Int64(2), arrays)
+    arrays.append(float_builder^.finish())
+    arrays.append(bool_builder^.finish())
+    var batch = RecordBatch(Int64(2), arrays.copy())
     var batches = List[RecordBatch]()
     batches.append(batch.copy())
 

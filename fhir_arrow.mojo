@@ -141,7 +141,7 @@ struct StringColumnBuilder(Movable):
         if self.null_count > 0:
             validity = _pack_bits(self.null_bits)
         return ArrowArray(
-            ArrowType.utf8(), self.length, self.null_count, validity, self.offsets^, self.values^
+            ArrowType.utf8(), self.length, self.null_count, validity^, self.offsets^, self.values^
         )
 
 
@@ -170,13 +170,13 @@ struct BoolColumnBuilder(Movable):
         self.null_count += 1
         self.length += 1
 
-    def finish(mut self) raises -> ArrowArray:
+    def finish(deinit self) raises -> ArrowArray:
         var validity = List[UInt8]()
         if self.null_count > 0:
             validity = _pack_bits(self.null_bits)
         var value_bytes = _pack_bits(self.value_bits)
         return ArrowArray(
-            ArrowType.bool_(), self.length, self.null_count, validity, List[UInt8](), value_bytes
+            ArrowType.bool_(), self.length, self.null_count, validity^, List[UInt8](), value_bytes^
         )
 
 
@@ -212,12 +212,12 @@ struct Float64ColumnBuilder(Movable):
         self.null_count += 1
         self.length += 1
 
-    def finish(mut self) raises -> ArrowArray:
+    def finish(deinit self) raises -> ArrowArray:
         var validity = List[UInt8]()
         if self.null_count > 0:
             validity = _pack_bits(self.null_bits)
         return ArrowArray(
-            ArrowType.float_(2), self.length, self.null_count, validity, List[UInt8](), self.values^
+            ArrowType.float_(2), self.length, self.null_count, validity^, List[UInt8](), self.values^
         )
 
 
@@ -250,9 +250,9 @@ struct PatientColumns(Movable):
         arrays.append(self.birth_date^.finish())
         arrays.append(self.family_name^.finish())
         arrays.append(self.given_name^.finish())
-        arrays.append(self.deceased.finish())
+        arrays.append(self.deceased^.finish())
         arrays.append(self.raw_json^.finish())
-        return RecordBatch(Int64(n), arrays)
+        return RecordBatch(Int64(n), arrays^)
 
 
 def shred_patient_fast_into_columns(
@@ -364,11 +364,11 @@ struct ObservationColumns(Movable):
         arrays.append(self.code_display^.finish())
         arrays.append(self.status^.finish())
         arrays.append(self.effective_datetime^.finish())
-        arrays.append(self.value_quantity.finish())
+        arrays.append(self.value_quantity^.finish())
         arrays.append(self.value_unit^.finish())
         arrays.append(self.value_string^.finish())
         arrays.append(self.raw_json^.finish())
-        return RecordBatch(Int64(n), arrays)
+        return RecordBatch(Int64(n), arrays^)
 
 
 def shred_observation_fast_into_columns(
@@ -504,7 +504,7 @@ struct ConditionColumns(Movable):
         arrays.append(self.onset_datetime^.finish())
         arrays.append(self.recorded_date^.finish())
         arrays.append(self.raw_json^.finish())
-        return RecordBatch(Int64(n), arrays)
+        return RecordBatch(Int64(n), arrays^)
 
 
 def shred_condition_fast_into_columns(

@@ -3,10 +3,10 @@
   "packages": [
     {
       "name": "arrow",
-      "version": "1.3.0",
-      "source_url": "https://github.com/Mosaad-M/arrow/archive/refs/tags/v1.3.0.tar.gz",
-      "sha256": "208ee29bd4c4a51f558af06107d1db56c8022a65e68e02cf2b90ddae051c2c5f",
-      "install_path": "/Users/myronmosaad/.mojo/packages/arrow/1.3.0"
+      "version": "2.0.0",
+      "source_url": "https://github.com/Mosaad-M/arrow/archive/refs/tags/v2.0.0.tar.gz",
+      "sha256": "b7c7eaf7f4fbc37728f466a41179534dfb6d7a4c1914ea10085640e9d8ab303c",
+      "install_path": "/Users/myronmosaad/.mojo/packages/arrow/2.0.0"
     },
     {
       "name": "flatbuffers",
