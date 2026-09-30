@@ -9,9 +9,9 @@ no C dependencies.
 
 ```bash
 pixi install                        # resolves arrow (git dep)
-pixi run test-ndjson                # 13 tests
+pixi run test-ndjson                # 17 tests
 pixi run test-fast-shred            # 37 tests
-pixi run test-fhir-arrow            # 34 tests
+pixi run test-fhir-arrow            # 38 tests
 ```
 
 For the large-file (multi-core) path:
@@ -30,6 +30,16 @@ doesn't pay for itself on small files, in either Mojo or Python.
 from fhir_arrow import ndjson_to_feather
 
 ndjson_to_feather("patients.ndjson", "patients.feather", "Patient")
+```
+
+For exports that don't comfortably fit in memory, the streaming variant
+takes the same arguments plus an optional chunk size (default 1 MiB) and
+produces the same rows in bounded memory:
+
+```mojo
+from fhir_arrow import ndjson_to_feather_streaming
+
+ndjson_to_feather_streaming("observations.ndjson", "observations.feather", "Observation")
 ```
 
 ```python
@@ -133,11 +143,11 @@ resource type (see Known limitations) -- a real, non-free addition.
   doubles wall-clock time per resource type), not a free addition.
 - `id` is the only field treated as required; every other field's absence
   is a null in that row, not an error.
-- No streaming on the sequential path: `read_ndjson_lines` loads the
-  whole file into memory as one `String` before shredding (lines are then
-  zero-copy byte spans into it, not separate allocations, but the whole
-  file is still resident at once). The parallel path reads bounded byte
-  ranges instead and fits large exports better.
+- `ndjson_to_feather` loads the whole file into memory and holds every
+  row until the end, peaking at roughly 8x the input size (2.1-2.3 GB for
+  a 261 MB Observation export). Use `ndjson_to_feather_streaming` for
+  large inputs. Its peak is about 20 MB plus 10x the chunk size instead,
+  and a single line longer than the chunk is still read whole.
 - `fast_shred.mojo`'s byte scanner is intentionally narrow, not a general
   JSON parser.
 
@@ -151,10 +161,36 @@ Condition rows), verified identical output field-by-field via real
 NDJSON line byte-for-byte with zero mismatches across every row.
 Regenerate the dataset with `bench/gen_synthea_data.sh 500 Massachusetts`.
 
+### Streaming vs. whole-file (sequential)
+
+Peak RSS (`/usr/bin/time -l`) and wall time, macOS arm64, 3 runs each, on
+a fresh `gen_synthea_data.sh 500 Massachusetts` export (576 Patient /
+250,116 Observation / 19,571 Condition rows). Streaming output was
+checked against the whole-file output with `pyarrow` (`Table.equals`)
+for all three resource types: identical.
+
+| Input | Path | Peak RSS | Time |
+|---|---|---|---|
+| Observation, 261 MB | whole-file | 2.1-2.3 GB | 1.21-1.27 s |
+| Observation, 261 MB | streaming, 1 MiB chunks | 29 MB | 975-983 ms |
+| Observation, 261 MB | streaming, 4 MiB chunks | 72 MB | 964-968 ms |
+| Observation, 261 MB | streaming, 16 MiB chunks | 177-178 MB | 976-984 ms |
+| Condition, 20 MB | whole-file | 197 MB | 79-80 ms |
+| Condition, 20 MB | streaming, 1 MiB chunks | 26 MB | 64-66 ms |
+| Patient, 1.9 MB | whole-file | 28 MB | 6-7 ms |
+| Patient, 1.9 MB | streaming, 1 MiB chunks | 21 MB | 5-6 ms |
+
+Memory tracks the chunk size, not the file size. Streaming is also
+slightly faster here, not slower. This hasn't been profiled; the much
+smaller working set is the likely reason. The output holds one
+RecordBatch per chunk (249 for the Observation file) where the
+whole-file path writes one.
+
 ## Dependencies
 
-- [arrow](https://github.com/Mosaad-M/arrow) `>=1.2.2`: pure-Mojo Arrow IPC
-  encoder/decoder (pulls in `flatbuffers` transitively)
+- [arrow](https://github.com/Mosaad-M/arrow) `>=1.3.0`: pure-Mojo Arrow IPC
+  encoder/decoder (pulls in `flatbuffers` transitively); `>=1.3.0` for
+  `ArrowFileWriter`, which the streaming path writes through
 
 No `max` dependency: the parallel path is process-level, driven entirely
 by the shell and this repo's own compiled binaries.

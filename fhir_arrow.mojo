@@ -26,10 +26,15 @@
 from std.pathlib import Path
 from arrow import (
     ArrowType, ArrowField, ArrowSchema, ArrowArray, RecordBatch,
-    encode_arrow_file, decode_arrow_file,
+    encode_arrow_file, decode_arrow_file, ArrowFileWriter,
 )
 from flatbuffers import write_i32_le, write_f64_le
-from ndjson import read_ndjson_lines, read_ndjson_range
+from ndjson import (
+    read_ndjson_lines,
+    read_ndjson_range,
+    _read_ndjson_range_spans,
+    _find_next_line_boundary,
+)
 from fast_shred import (
     _find_keys, _find_key, _first_array_element, _coding0_at,
     _extract_bool, _extract_number, _decode_escaped_string_into,
@@ -609,6 +614,36 @@ def _shred_condition_lines(b: Span[UInt8, _], spans: List[Tuple[Int, Int]]) rais
     return columns^.finish()
 
 
+def _schema_for_kind(kind: String, caller: String) raises -> ArrowSchema:
+    """The output schema for a resource kind; also the single place an
+    unknown kind is rejected, before any input is read or output created."""
+    if kind == "Patient":
+        return patient_schema()
+    elif kind == "Observation":
+        return observation_schema()
+    elif kind == "Condition":
+        return condition_schema()
+    raise Error(
+        "fhir_arrow: "
+        + caller
+        + ": unknown resource kind '"
+        + kind
+        + "' (expected Patient, Observation, or Condition)"
+    )
+
+
+def _shred_lines_for_kind(
+    b: Span[UInt8, _], spans: List[Tuple[Int, Int]], kind: String
+) raises -> RecordBatch:
+    """Dispatch to the per-kind shredder. `kind` must already have been
+    validated by _schema_for_kind."""
+    if kind == "Patient":
+        return _shred_patient_lines(b, spans)
+    elif kind == "Observation":
+        return _shred_observation_lines(b, spans)
+    return _shred_condition_lines(b, spans)
+
+
 def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raises:
     """Read a Bulk FHIR NDJSON export file of one resource type and write a
     Feather file of its shredded columns. `kind` is one of "Patient",
@@ -624,30 +659,10 @@ def ndjson_to_feather(ndjson_path: String, out_path: String, kind: String) raise
     var spans = result[1].copy()
     var b = content.as_bytes()
 
-    if kind == "Patient":
-        var batch = _shred_patient_lines(b, spans)
-        var batches = List[RecordBatch]()
-        batches.append(batch^)
-        var file_bytes = encode_arrow_file(patient_schema(), batches)
-        Path(out_path).write_bytes(file_bytes)
-    elif kind == "Observation":
-        var batch = _shred_observation_lines(b, spans)
-        var batches = List[RecordBatch]()
-        batches.append(batch^)
-        var file_bytes = encode_arrow_file(observation_schema(), batches)
-        Path(out_path).write_bytes(file_bytes)
-    elif kind == "Condition":
-        var batch = _shred_condition_lines(b, spans)
-        var batches = List[RecordBatch]()
-        batches.append(batch^)
-        var file_bytes = encode_arrow_file(condition_schema(), batches)
-        Path(out_path).write_bytes(file_bytes)
-    else:
-        raise Error(
-            "fhir_arrow: ndjson_to_feather: unknown resource kind '"
-            + kind
-            + "' (expected Patient, Observation, or Condition)"
-        )
+    var schema = _schema_for_kind(kind, "ndjson_to_feather")
+    var batches = List[RecordBatch]()
+    batches.append(_shred_lines_for_kind(b, spans, kind))
+    Path(out_path).write_bytes(encode_arrow_file(schema, batches))
 
 
 def ndjson_range_to_feather(
@@ -665,29 +680,63 @@ def ndjson_range_to_feather(
     var spans = result[1].copy()
     var b = content.as_bytes()
 
-    if kind == "Patient":
-        var batch = _shred_patient_lines(b, spans)
-        var batches = List[RecordBatch]()
-        batches.append(batch^)
-        var file_bytes = encode_arrow_file(patient_schema(), batches)
-        Path(out_path).write_bytes(file_bytes)
-    elif kind == "Observation":
-        var batch = _shred_observation_lines(b, spans)
-        var batches = List[RecordBatch]()
-        batches.append(batch^)
-        var file_bytes = encode_arrow_file(observation_schema(), batches)
-        Path(out_path).write_bytes(file_bytes)
-    elif kind == "Condition":
-        var batch = _shred_condition_lines(b, spans)
-        var batches = List[RecordBatch]()
-        batches.append(batch^)
-        var file_bytes = encode_arrow_file(condition_schema(), batches)
-        Path(out_path).write_bytes(file_bytes)
-    else:
+    var schema = _schema_for_kind(kind, "ndjson_range_to_feather")
+    var batches = List[RecordBatch]()
+    batches.append(_shred_lines_for_kind(b, spans, kind))
+    Path(out_path).write_bytes(encode_arrow_file(schema, batches))
+
+
+def ndjson_to_feather_streaming(
+    ndjson_path: String,
+    out_path: String,
+    kind: String,
+    max_chunk_bytes: Int = 1024 * 1024,
+) raises:
+    """Same output as ndjson_to_feather (same rows, same order), but in
+    memory bounded by `max_chunk_bytes` rather than by the file size. Reads
+    the file one chunk at a time, each chunk extended to the next line
+    boundary via _find_next_line_boundary so no record is split, shreds it,
+    and appends it as one RecordBatch straight to `out_path` via
+    ArrowFileWriter. Nothing from earlier chunks stays resident except the
+    footer's 24 bytes per written batch.
+
+    A single line longer than max_chunk_bytes is still read whole, so the
+    real bound is max(max_chunk_bytes, longest line). The output holds one
+    RecordBatch per non-blank chunk instead of ndjson_to_feather's single
+    batch; Arrow readers see the same table either way."""
+    if max_chunk_bytes <= 0:
         raise Error(
-            "fhir_arrow: ndjson_range_to_feather: unknown resource kind '"
-            + kind
-            + "' (expected Patient, Observation, or Condition)"
+            "fhir_arrow: ndjson_to_feather_streaming: max_chunk_bytes must be positive"
+        )
+    var schema = _schema_for_kind(kind, "ndjson_to_feather_streaming")
+
+    var f = open(ndjson_path, "r")
+    var file_size = Int(f.seek(0, 2))
+    f.close()
+
+    var writer = ArrowFileWriter(out_path, schema)
+    var start = 0
+    var records_seen = 0
+    while start < file_size:
+        # Scanning from target - 1 (not target) keeps a chunk that already
+        # ends exactly on a newline as-is instead of pulling in the next line.
+        var end = file_size
+        if start + max_chunk_bytes < file_size:
+            end = _find_next_line_boundary(ndjson_path, start + max_chunk_bytes - 1)
+
+        var result = _read_ndjson_range_spans(ndjson_path, start, end)
+        var spans = result[1].copy()
+        if len(spans) > 0:
+            writer.write_batch(_shred_lines_for_kind(result[0].as_bytes(), spans, kind))
+            records_seen += len(spans)
+        start = end
+    writer.finish()
+
+    # Checked after finish() so the output file is never left truncated;
+    # matches ndjson_to_feather's "no records" error.
+    if records_seen == 0:
+        raise Error(
+            "fhir_arrow: ndjson_to_feather_streaming: no records found in " + ndjson_path
         )
 
 

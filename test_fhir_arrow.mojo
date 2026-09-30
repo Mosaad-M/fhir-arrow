@@ -1,5 +1,6 @@
 from fhir_arrow import (
     ndjson_to_feather, ndjson_range_to_feather, merge_feathers,
+    ndjson_to_feather_streaming,
     PatientColumns, shred_patient_fast_into_columns,
     ObservationColumns, shred_observation_fast_into_columns,
     ConditionColumns, shred_condition_fast_into_columns,
@@ -993,6 +994,105 @@ def test_fused_condition_multi_row_column_alignment() raises:
     assert_eq_str(_get_utf8(raw_col, 2), lines[2], "row 2 raw_json matches source line")
 
 
+# ── ndjson_to_feather_streaming: bounded-memory sequential path ─────────────
+
+
+def _with_blank_lines(fixture: String, out_path: String) raises:
+    """Copies a fixture with blank lines between records, so small chunks
+    can land on nothing but blank lines -- which streaming must skip."""
+    var content = Path(fixture).read_text()
+    var out = String("\n")
+    var start = 0
+    while True:
+        var idx = content.find("\n", start)
+        if idx < 0:
+            out += String(content[byte=start:])
+            break
+        out += String(content[byte=start : idx + 1]) + "\n\n"
+        start = idx + 1
+    Path(out_path).write_text(out)
+
+
+def _flattened_ids(path: String) raises -> List[String]:
+    var result = decode_arrow_file(Path(path).read_bytes())
+    var ids = List[String]()
+    for batch in result[1]:
+        var id_col = batch.columns[0].copy()
+        for r in range(Int(batch.length)):
+            ids.append(_get_utf8(id_col, r))
+    return ids^
+
+
+def _assert_streaming_matches_sequential(fixture: String, kind: String) raises:
+    var src = "/tmp/fhir_arrow_stream_src_" + kind + ".ndjson"
+    _with_blank_lines(fixture, src)
+    ndjson_to_feather(src, "/tmp/fhir_arrow_stream_seq.feather", kind)
+    var expected = _flattened_ids("/tmp/fhir_arrow_stream_seq.feather")
+    assert_true(len(expected) >= 2, kind + ": fixture has multiple records")
+    var sizes = List[Int]()
+    sizes.append(1)
+    sizes.append(100)
+    sizes.append(1000000)
+    for size in sizes:
+        ndjson_to_feather_streaming(src, "/tmp/fhir_arrow_stream_out.feather", kind, size)
+        var actual = _flattened_ids("/tmp/fhir_arrow_stream_out.feather")
+        var label = kind + " chunk=" + String(size)
+        assert_eq_int(len(actual), len(expected), label + ": row count")
+        for r in range(len(expected)):
+            assert_eq_str(actual[r], expected[r], label + " row " + String(r) + " id")
+
+
+def test_streaming_equivalent_to_sequential_all_kinds() raises:
+    """Streaming output must match ndjson_to_feather row for row, in order,
+    for every resource kind, at chunk sizes from one byte (every record its
+    own chunk, many chunks blank) up to larger than the file."""
+    _assert_streaming_matches_sequential("fixtures/patients_small.ndjson", "Patient")
+    _assert_streaming_matches_sequential("fixtures/observations_small.ndjson", "Observation")
+    _assert_streaming_matches_sequential("fixtures/conditions_small.ndjson", "Condition")
+
+
+def test_streaming_small_chunks_produce_multiple_batches() raises:
+    """Guards against a streaming path that silently reads the file as one
+    chunk: one-byte chunks must yield one RecordBatch per record."""
+    var src = "/tmp/fhir_arrow_stream_src_Patient.ndjson"
+    _with_blank_lines("fixtures/patients_small.ndjson", src)
+    ndjson_to_feather_streaming(src, "/tmp/fhir_arrow_stream_out.feather", "Patient", 1)
+    var result = decode_arrow_file(Path("/tmp/fhir_arrow_stream_out.feather").read_bytes())
+    assert_eq_int(len(result[1]), 3, "one batch per patient record")
+
+
+def test_streaming_rejects_bad_arguments() raises:
+    var raised = False
+    try:
+        ndjson_to_feather_streaming(
+            "fixtures/patients_small.ndjson", "/tmp/fhir_arrow_stream_bad.feather", "Patient", 0
+        )
+    except:
+        raised = True
+    assert_true(raised, "max_chunk_bytes=0 should raise")
+    raised = False
+    try:
+        ndjson_to_feather_streaming(
+            "fixtures/patients_small.ndjson", "/tmp/fhir_arrow_stream_bad.feather", "Encounter"
+        )
+    except:
+        raised = True
+    assert_true(raised, "unknown kind should raise")
+
+
+def test_streaming_no_records_raises() raises:
+    """Same contract as ndjson_to_feather: no records at all is an error."""
+    Path("/tmp/fhir_arrow_stream_blank.ndjson").write_text("\n\n\n")
+    var raised = False
+    try:
+        ndjson_to_feather_streaming(
+            "/tmp/fhir_arrow_stream_blank.ndjson", "/tmp/fhir_arrow_stream_bad.feather", "Patient", 2
+        )
+    except:
+        raised = True
+    assert_true(raised, "all-blank file should raise")
+
+
 def main() raises:
     test_string_column_roundtrip_with_null()
     print("PASS test_string_column_roundtrip_with_null")
@@ -1095,5 +1195,14 @@ def main() raises:
 
     test_fused_condition_multi_row_column_alignment()
     print("PASS test_fused_condition_multi_row_column_alignment")
+
+    test_streaming_equivalent_to_sequential_all_kinds()
+    print("PASS test_streaming_equivalent_to_sequential_all_kinds")
+    test_streaming_small_chunks_produce_multiple_batches()
+    print("PASS test_streaming_small_chunks_produce_multiple_batches")
+    test_streaming_rejects_bad_arguments()
+    print("PASS test_streaming_rejects_bad_arguments")
+    test_streaming_no_records_raises()
+    print("PASS test_streaming_no_records_raises")
 
     print("\nAll fhir_arrow builder tests passed.")
