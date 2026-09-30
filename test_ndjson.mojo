@@ -1,4 +1,9 @@
-from ndjson import find_line_spans, read_ndjson_lines, read_ndjson_range
+from ndjson import (
+    find_line_spans,
+    read_ndjson_lines,
+    read_ndjson_range,
+    _find_next_line_boundary,
+)
 from std.pathlib import Path
 
 
@@ -196,6 +201,52 @@ def test_read_ndjson_range_empty_range_raises() raises:
     assert_true(raised, "empty byte range should raise")
 
 
+# ── _find_next_line_boundary: bounded-window scan for the streaming path ────
+
+
+def test_find_next_line_boundary_from_mid_line() raises:
+    _write("/tmp/fhir_arrow_test_boundary.ndjson", "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n")
+    # Offset 3 is inside line 0; its '\n' is at index 7, so line 1 starts at 8.
+    assert_eq_int(
+        _find_next_line_boundary("/tmp/fhir_arrow_test_boundary.ndjson", 3, 4096),
+        8,
+        "boundary right after the next newline",
+    )
+
+
+def test_find_next_line_boundary_on_newline_itself() raises:
+    _write("/tmp/fhir_arrow_test_boundary.ndjson", "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n")
+    # Offset 7 IS the newline; the boundary is the byte right after it.
+    assert_eq_int(
+        _find_next_line_boundary("/tmp/fhir_arrow_test_boundary.ndjson", 7, 4096),
+        8,
+        "offset on a newline returns the position right after it",
+    )
+
+
+def test_find_next_line_boundary_no_further_newline_returns_eof() raises:
+    _write("/tmp/fhir_arrow_test_boundary_eof.ndjson", "{\"a\":1}\n{\"b\":2}")
+    assert_eq_int(
+        _find_next_line_boundary("/tmp/fhir_arrow_test_boundary_eof.ndjson", 9, 4096),
+        15,
+        "no newline before EOF returns the file size",
+    )
+
+
+def test_find_next_line_boundary_search_spans_multiple_windows() raises:
+    # A 50-byte line scanned with a 4-byte window: the newline is found
+    # several windows past the starting offset.
+    var line = String("")
+    for _ in range(49):
+        line += "x"
+    _write("/tmp/fhir_arrow_test_boundary_windows.ndjson", line + "\n{}\n")
+    assert_eq_int(
+        _find_next_line_boundary("/tmp/fhir_arrow_test_boundary_windows.ndjson", 2, 4),
+        50,
+        "newline found across window boundaries",
+    )
+
+
 def main() raises:
     test_find_line_spans_offsets_correct()
     print("PASS test_find_line_spans_offsets_correct")
@@ -235,5 +286,14 @@ def main() raises:
 
     test_read_ndjson_range_empty_range_raises()
     print("PASS test_read_ndjson_range_empty_range_raises")
+
+    test_find_next_line_boundary_from_mid_line()
+    print("PASS test_find_next_line_boundary_from_mid_line")
+    test_find_next_line_boundary_on_newline_itself()
+    print("PASS test_find_next_line_boundary_on_newline_itself")
+    test_find_next_line_boundary_no_further_newline_returns_eof()
+    print("PASS test_find_next_line_boundary_no_further_newline_returns_eof")
+    test_find_next_line_boundary_search_spans_multiple_windows()
+    print("PASS test_find_next_line_boundary_search_spans_multiple_windows")
 
     print("\nAll ndjson tests passed.")

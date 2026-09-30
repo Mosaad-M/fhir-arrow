@@ -55,6 +55,46 @@ def read_ndjson_lines(path: String) raises -> Tuple[String, List[Tuple[Int, Int]
     return Tuple[String, List[Tuple[Int, Int]]](content^, spans^)
 
 
+def _find_next_line_boundary(
+    path: String, target_offset: Int, window_size: Int = 65536
+) raises -> Int:
+    """Seeks to `target_offset` (need not be on a line boundary) and scans
+    forward in `window_size` reads for the next '\\n', WITHOUT reading the
+    whole file: the streaming path's chunk-boundary primitive (unlike
+    chunk_planner.mojo, which reads the whole file up front). Returns the
+    byte offset right after that newline, i.e. the start of the next line.
+    If no further newline exists, returns the file size."""
+    var f = open(path, "r")
+    _ = f.seek(target_offset)
+    var pos = target_offset
+    while True:
+        var chunk = f.read(window_size)
+        if chunk.byte_length() == 0:
+            f.close()
+            return pos
+        var idx = chunk.find("\n")
+        if idx >= 0:
+            f.close()
+            return pos + idx + 1
+        pos += chunk.byte_length()
+
+
+def _read_ndjson_range_spans(
+    path: String, start_byte: Int, end_byte: Int
+) raises -> Tuple[String, List[Tuple[Int, Int]]]:
+    """Reads exactly [start_byte, end_byte) via seek+read and finds the line
+    spans in it, returning an empty span list (not an error) for a range of
+    only blank lines. read_ndjson_range adds the "no records" check; the
+    streaming path calls this directly, since an all-blank chunk is fine
+    there."""
+    var f = open(path, "r")
+    _ = f.seek(start_byte)
+    var content = f.read(end_byte - start_byte)
+    f.close()
+    var spans = find_line_spans(content)
+    return Tuple[String, List[Tuple[Int, Int]]](content^, spans^)
+
+
 def read_ndjson_range(
     path: String, start_byte: Int, end_byte: Int
 ) raises -> Tuple[String, List[Tuple[Int, Int]]]:
@@ -66,13 +106,8 @@ def read_ndjson_range(
     responsible for aligning start_byte/end_byte to line boundaries -- this
     function doesn't adjust for misaligned input, it just reads exactly the
     given byte range and finds line spans within it."""
-    var f = open(path, "r")
-    _ = f.seek(start_byte)
-    var content = f.read(end_byte - start_byte)
-    f.close()
-
-    var spans = find_line_spans(content)
-    if len(spans) == 0:
+    var result = _read_ndjson_range_spans(path, start_byte, end_byte)
+    if len(result[1]) == 0:
         raise Error(
             "ndjson: read_ndjson_range: no records found in "
             + path
@@ -83,4 +118,4 @@ def read_ndjson_range(
             + ")"
         )
 
-    return Tuple[String, List[Tuple[Int, Int]]](content^, spans^)
+    return result^
