@@ -1,0 +1,41 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Dependencies are checked out at the exact versions pinned in mojo.lock,
+# so CI builds what the lockfile (and every local build) uses.
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out dependencies pinned in mojo.lock
+        run: |
+          : > .mojo_flags
+          for name in $(jq -r '.packages[].name' mojo.lock); do
+            version=$(jq -r --arg n "$name" '.packages[] | select(.name == $n) | .version' mojo.lock)
+            git clone -q --depth 1 --branch "v$version" "https://github.com/Mosaad-M/$name" "deps/$name"
+            printf -- '-I %s ' "$PWD/deps/$name" >> .mojo_flags
+          done
+          echo "flags: $(cat .mojo_flags)"
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+
+      - name: Run tests and build binaries
+        run: |
+          for task in test-ndjson test-fast-shred test-fhir-arrow build-chunk-planner build-parallel-worker build-merge-worker; do
+            echo "::group::$task"
+            pixi run $task
+            echo "::endgroup::"
+          done
