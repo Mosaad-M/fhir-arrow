@@ -58,7 +58,7 @@ def _get_utf8(col: ArrowArray, row: Int) raises -> String:
     var sb = List[UInt8]()
     for i in range(off_start, off_end):
         sb.append(col.values[i])
-    return String(unsafe_from_utf8=sb^)
+    return String(unsafe_from_utf8=sb)
 
 
 def _get_float64(col: ArrowArray, row: Int) raises -> Float64:

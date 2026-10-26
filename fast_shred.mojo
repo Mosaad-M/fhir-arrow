@@ -396,7 +396,7 @@ def _extract_string(b: Span[UInt8, _], start: Int) raises -> String:
             var length = j - (start + 1)
             var result = List[UInt8](capacity=length)
             result.extend(b[start + 1 : j])
-            return String(unsafe_from_utf8=result^)
+            return String(unsafe_from_utf8=result)
         elif c == _BACKSLASH:
             break
         j += 1
@@ -457,7 +457,7 @@ def _extract_string_escaped(b: Span[UInt8, _], start: Int) raises -> String:
     a backslash has been seen. start must point at the opening quote."""
     var result = List[UInt8](capacity=32)
     _ = _decode_escaped_string_into(b, start, result)
-    return String(unsafe_from_utf8=result^)
+    return String(unsafe_from_utf8=result)
 
 
 def _extract_number(b: Span[UInt8, _], start: Int) raises -> Float64:
@@ -466,7 +466,7 @@ def _extract_number(b: Span[UInt8, _], start: Int) raises -> Float64:
     var num_bytes = List[UInt8](capacity=end - start)
     for i in range(start, end):
         num_bytes.append(b[i])
-    var s = String(unsafe_from_utf8=num_bytes^)
+    var s = String(unsafe_from_utf8=num_bytes)
     return Float64(s)
 
 

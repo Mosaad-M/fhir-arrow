@@ -5,6 +5,8 @@ into columnar `.feather` files, using a hand-rolled zero-tree byte scanner
 (no JSON tree is ever built) and a pure-Mojo Arrow IPC encoder. No Python,
 no C dependencies.
 
+Requires Mojo `>= 1.2.0`.
+
 ## Quick start
 
 ```bash
