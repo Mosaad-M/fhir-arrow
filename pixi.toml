@@ -16,4 +16,4 @@ build-chunk-planner = "bash -c 'mojo build $(cat .mojo_flags 2>/dev/null) chunk_
 format = "mblack ndjson.mojo resources.mojo fast_shred.mojo fhir_arrow.mojo parallel_worker.mojo merge_worker.mojo chunk_planner.mojo test_ndjson.mojo test_fast_shred.mojo test_fhir_arrow.mojo"
 
 [dependencies]
-mojo = ">=1.0.0"
+mojo = ">=1.2.0"
